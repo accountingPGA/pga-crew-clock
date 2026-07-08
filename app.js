@@ -17,8 +17,10 @@ let pendingSwitchLunch = null;
 let isProcessing = false;
 let toastTimer;
 let renderTimer;
+let configRefreshTimer;
 const expandedRouteEmployeeIds = new Set();
 const collapsedAlertGroupKeys = new Set();
+const MANAGER_ROLES = new Set(["manager", "admin", "foreman", "supervisor"]);
 const ALERT_GROUPS = [
   { key: "notCheckedIn", label: "Not Checked In Yet" },
   { key: "stillClockedIn", label: "Still Clocked In" },
@@ -136,6 +138,9 @@ function setup() {
     renderClockOnly();
     if (currentUser) render();
   }, 1000);
+
+  window.clearInterval(configRefreshTimer);
+  configRefreshTimer = window.setInterval(refreshConfigFromBackend, 30000);
 }
 
 async function loadConfig() {
@@ -147,10 +152,22 @@ async function loadConfig() {
   saveUiState();
 }
 
+async function refreshConfigFromBackend() {
+  if (!currentUser || isProcessing) return;
+  try {
+    await loadConfig();
+    renderSelect(els.siteSelect, sites, state.selectedSite);
+    render();
+  } catch (error) {
+    console.warn("Crew Clock refresh failed", error);
+  }
+}
+
 function normalizeConfig(data) {
   const loadedEmployees = Array.isArray(data?.employees) ? data.employees : [];
   const loadedJobsites = Array.isArray(data?.jobsites) ? data.jobsites : [];
   const loadedSubmissions = Array.isArray(data?.submissions) ? data.submissions : [];
+  const loadedOpenShifts = Array.isArray(data?.openShifts) ? data.openShifts : [];
 
   employees = loadedEmployees
     .map((employee) => ({
@@ -161,7 +178,10 @@ function normalizeConfig(data) {
       role: String(employee.role || "employee").trim().toLowerCase()
     }))
     .filter((employee) => employee.id && employee.name && employee.pin)
-    .map((employee) => ({ ...employee, role: employee.role === "manager" ? "manager" : "employee" }));
+    .map((employee) => ({
+      ...employee,
+      role: MANAGER_ROLES.has(employee.role) ? employee.role : "employee"
+    }));
 
   const normalizedJobsites = loadedJobsites
     .map((site) => {
@@ -181,7 +201,10 @@ function normalizeConfig(data) {
     return map;
   }, {});
 
-  serverSubmissions = loadedSubmissions.map(normalizeSubmission).filter((row) => row.submissionId);
+  serverSubmissions = loadedSubmissions
+    .concat(loadedOpenShifts)
+    .map(normalizeSubmission)
+    .filter((row) => row.submissionId);
   mergeSubmissions();
   features = data?.features || {};
 }
@@ -190,6 +213,7 @@ function normalizeSubmission(row) {
   const worker = String(row.worker || "").trim();
   return {
     submissionId: String(row.submissionId || row.id || "").trim(),
+    openShiftId: String(row.openShiftId || row.openId || "").trim(),
     submittedAt: String(row.submittedAt || "").trim(),
     employeeId: String(row.employeeId || row.workerId || safeWorkerId(worker) || "").trim(),
     employeeName: String(row.employeeName || row.name || worker || "").trim(),
@@ -202,6 +226,7 @@ function normalizeSubmission(row) {
     importedAt: String(row.importedAt || "").trim(),
     rowNumber: Number(row.rowNumber || 0),
     localOnly: Boolean(row.localOnly),
+    openOnly: Boolean(row.openOnly || row.isOpen),
     syncStatus: String(row.syncStatus || "").trim(),
     error: String(row.error || "").trim(),
     startIso: String(row.startIso || row.startTime || "").trim(),
@@ -222,7 +247,12 @@ function pruneLocalSubmissions(rows) {
 
 function mergeSubmissions() {
   state.localSubmissions = pruneLocalSubmissions(state.localSubmissions || []);
-  submissions = [...serverSubmissions, ...state.localSubmissions];
+  const serverIds = new Set(serverSubmissions.map((row) => row.submissionId).filter(Boolean));
+  const localOnlyRows = state.localSubmissions.filter((row) => (
+    !serverIds.has(row.submissionId) &&
+    !serverIds.has(row.serverSubmissionId)
+  ));
+  submissions = [...serverSubmissions, ...localOnlyRows];
 }
 
 function updateLocalSubmissions(updater) {
@@ -261,7 +291,10 @@ async function apiPost(action, payload) {
 }
 
 function hasConfigPayload(data) {
-  return Array.isArray(data?.employees) || Array.isArray(data?.jobsites) || Array.isArray(data?.submissions);
+  return Array.isArray(data?.employees) ||
+    Array.isArray(data?.jobsites) ||
+    Array.isArray(data?.submissions) ||
+    Array.isArray(data?.openShifts);
 }
 
 function renderSelect(select, options, selectedValue) {
@@ -339,6 +372,7 @@ function showApp() {
   applyPermissions();
   showView(isManager() ? "summary" : "clock");
   render();
+  refreshConfigFromBackend();
 }
 
 function logout() {
@@ -348,7 +382,7 @@ function logout() {
 }
 
 function isManager() {
-  return String(currentUser?.role || "").toLowerCase() === "manager";
+  return MANAGER_ROLES.has(String(currentUser?.role || "").toLowerCase());
 }
 
 function applyPermissions() {
@@ -410,19 +444,45 @@ async function clockIn() {
   const jobsite = els.siteSelect.value || state.selectedSite;
   if (!jobsite) return showError("Please select a jobsite.");
 
+  setProcessing(true);
+  setSyncMessage("Clocking in...", false);
   try {
-    const startedAt = new Date();
-    const row = localClockRow(jobsite, startedAt);
-    updateLocalSubmissions((rows) => [row, ...rows.filter((item) => item.employeeId !== currentUser.id || item.endTime)]);
+    const token = await ensureSessionToken();
+    await apiPost("clockIn", { token, jobsite });
     state.selectedSite = jobsite;
     saveUiState();
-    setSyncMessage("Clocked in. Saves at clock out.", false);
-    showToast("Clocked in");
+    setSyncMessage("Clocked in and synced", false);
+    showToast("Clocked in and synced");
     render();
   } catch (error) {
     console.error(error);
-    showError(error.message ? `Clock In failed. ${error.message}` : "Clock In failed. Please try again.");
+    if (isBackendOpenShiftMissing(error)) {
+      createLocalClockInFallback(jobsite);
+    } else {
+      showError(error.message ? `Clock In failed. ${error.message}` : "Clock In failed. Please try again.");
+    }
+  } finally {
+    setProcessing(false);
   }
+}
+
+function createLocalClockInFallback(jobsite) {
+  const startedAt = new Date();
+  const row = localClockRow(jobsite, startedAt);
+  updateLocalSubmissions((rows) => [row, ...rows.filter((item) => item.employeeId !== currentUser.id || item.endTime)]);
+  state.selectedSite = jobsite;
+  saveUiState();
+  setSyncMessage("Backend open-shift update needed. Clocked in on this device only.", true);
+  showToast("Clocked in on this device");
+  render();
+}
+
+function isBackendOpenShiftMissing(error) {
+  return /unknown action/i.test(String(error?.message || ""));
+}
+
+function openShiftIdentifier(row) {
+  return row.openShiftId || row.submissionId;
 }
 
 function localClockRow(jobsite, startedAt) {
@@ -494,9 +554,12 @@ async function clockOut(submissionId, lunch) {
   }
 
   await runSyncedAction(async () => {
+    const token = await ensureSessionToken();
     await apiPost("clockOut", {
+      token,
       employeeId: currentUser.id,
       submissionId,
+      openShiftId: openShiftIdentifier(current),
       lunch
     });
     closeLunchDialog();
@@ -540,9 +603,12 @@ async function confirmSwitchJobsite() {
   }
 
   await runSyncedAction(async () => {
+    const token = await ensureSessionToken();
     await apiPost("switchJobsite", {
+      token,
       employeeId: currentUser.id,
       submissionId: current.submissionId,
+      openShiftId: openShiftIdentifier(current),
       lunch: pendingSwitchLunch,
       newJobsite: nextJobsite
     });
@@ -987,9 +1053,10 @@ function sortSubmissionsAscending(rows) {
 }
 
 function sortValue(row) {
+  const parsed = Date.parse(row.startIso || `${row.date || todayKey()} ${row.startTime || ""}`);
+  if (Number.isFinite(parsed)) return parsed;
   if (Number.isFinite(row.rowNumber) && row.rowNumber > 0) return row.rowNumber;
-  const parsed = Date.parse(`${row.date || todayKey()} ${row.startTime || ""}`);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return 0;
 }
 
 function todayRowsOnly() {
