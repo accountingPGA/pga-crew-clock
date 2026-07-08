@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f8fa" />
+    <title>Pinnacle Crew Clock</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <section class="login-screen" id="loginScreen" aria-label="Crew Clock Login">
+      <div class="login-card">
+        <div class="login-brand">
+          <img class="brand-mark" src="./assets/brand-mark.svg" alt="" onerror="this.style.display='none'" />
+          <p class="eyebrow">Pinnacle Glass and Aluminum Ltd.</p>
+          <h1>Crew Clock</h1>
+        </div>
+
+        <div class="pin-panel">
+          <h2>Enter your 4-digit PIN</h2>
+          <div class="pin-dots" id="pinDots" aria-label="PIN entry progress">
+            <span></span><span></span><span></span><span></span>
+          </div>
+          <p class="login-error" id="loginError" role="alert"></p>
+        </div>
+
+        <div class="pin-keypad" aria-label="Numeric keypad">
+          <button type="button" data-pin="1">1</button>
+          <button type="button" data-pin="2">2</button>
+          <button type="button" data-pin="3">3</button>
+          <button type="button" data-pin="4">4</button>
+          <button type="button" data-pin="5">5</button>
+          <button type="button" data-pin="6">6</button>
+          <button type="button" data-pin="7">7</button>
+          <button type="button" data-pin="8">8</button>
+          <button type="button" data-pin="9">9</button>
+          <button class="keypad-muted" type="button" data-pin-clear>Clear</button>
+          <button type="button" data-pin="0">0</button>
+          <button class="keypad-muted" type="button" data-pin-back>⌫</button>
+        </div>
+      </div>
+    </section>
+
+    <main class="app-shell app-hidden" id="appShell" aria-label="Crew Clock">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <img class="brand-mark" src="./assets/brand-mark.svg" alt="" onerror="this.style.display='none'" />
+          <div>
+            <p class="eyebrow">Pinnacle Glass and Aluminum Ltd.</p>
+            <h1>Crew Clock</h1>
+          </div>
+        </div>
+        <div class="user-actions">
+          <span class="current-user" id="currentUserLabel">Not signed in</span>
+          <button class="icon-button" id="logoutButton" type="button" aria-label="Log out" title="Log out">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10 17l5-5-5-5" />
+              <path d="M15 12H3" />
+              <path d="M21 19V5" />
+            </svg>
+          </button>
+          <button class="icon-button manager-only" id="exportButton" type="button" aria-label="Export" title="Export" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v11m0 0 4-4m-4 4-4-4" />
+              <path d="M5 15v3a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-3" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Primary">
+        <button class="tab active" type="button" data-tab="clock">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="8" />
+            <path d="M12 8v5l3 2" />
+          </svg>
+          Clock
+        </button>
+        <button class="tab manager-only" type="button" data-tab="summary" id="summaryTab">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M16 19c0-2.2-1.8-4-4-4s-4 1.8-4 4" />
+            <circle cx="12" cy="8" r="3" />
+            <path d="M21 18c-.4-1.5-1.5-2.6-3-3" />
+            <path d="M18 5.2a2.5 2.5 0 0 1 0 4.6" />
+            <path d="M3 18c.4-1.5 1.5-2.6 3-3" />
+            <path d="M6 5.2a2.5 2.5 0 0 0 0 4.6" />
+          </svg>
+          Daily Summary
+        </button>
+        <button class="tab manager-only" type="button" data-tab="alerts" id="alertsTab">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 9v4" />
+            <path d="M12 17h.01" />
+            <path d="M10.3 4.2 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0Z" />
+          </svg>
+          <span id="alertsTabLabel">⚠️ Alerts</span>
+        </button>
+      </nav>
+
+      <section class="view active" id="clockView" aria-labelledby="clockTitle">
+        <section class="status-panel" aria-labelledby="clockTitle">
+          <div class="status-topline">
+            <span id="statusPill" class="status-pill out">○ CLOCKED OUT</span>
+            <span id="liveClock" class="live-clock"></span>
+          </div>
+          <h2 id="clockTitle">Ready for shift</h2>
+          <p id="statusDetail" class="status-detail">Select a jobsite</p>
+          <p id="syncMessage" class="sync-message" role="status" aria-live="polite"></p>
+
+          <div class="shift-controls" aria-label="Shift options">
+            <label>
+              Jobsite
+              <select id="siteSelect"></select>
+            </label>
+          </div>
+
+          <div class="primary-actions" id="primaryActions">
+            <button class="primary-button" id="clockButton" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v7l4 2" />
+                <circle cx="12" cy="12" r="9" />
+              </svg>
+              Clock in
+            </button>
+            <button class="secondary-button" id="switchButton" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7 7h11l-3-3" />
+                <path d="M17 17H6l3 3" />
+                <path d="M18 7l-3 3" />
+                <path d="M6 17l3-3" />
+              </svg>
+              Switch jobsite
+            </button>
+          </div>
+        </section>
+
+        <section class="summary-grid" aria-label="Today summary">
+          <article class="summary-item">
+            <span>Sync</span>
+            <strong id="syncStatus">Ready</strong>
+          </article>
+          <article class="summary-item accent-coral">
+            <span>Lunch</span>
+            <strong id="lunchSummary">—</strong>
+          </article>
+          <article class="summary-item accent-blue">
+            <span>Rows</span>
+            <strong id="todayRecordCount">0</strong>
+          </article>
+        </section>
+
+        <section class="timeline-panel" aria-labelledby="timelineTitle">
+          <div class="section-heading">
+            <h2 id="timelineTitle">Today</h2>
+            <span id="entryCount" class="muted"></span>
+          </div>
+          <div id="timelineList" class="timeline-list"></div>
+        </section>
+      </section>
+
+      <section class="view" id="summaryView" aria-labelledby="summaryTitle">
+        <div class="team-head">
+          <div>
+            <p class="eyebrow">Manager</p>
+            <h2 id="summaryTitle">Daily Summary</h2>
+          </div>
+          <span id="checkedInTodayCount" class="review-pill">🟢 Checked in today: 0</span>
+        </div>
+
+        <section class="team-list-section" aria-labelledby="liveJobsitesTitle">
+          <div class="section-heading">
+            <h2 id="liveJobsitesTitle">Current Jobsites</h2>
+          </div>
+          <div id="liveJobsiteList" class="jobsite-live-list"></div>
+        </section>
+      </section>
+
+      <section class="view" id="alertsView" aria-labelledby="alertsTitle">
+        <div class="team-head">
+          <div>
+            <p class="eyebrow">Manager</p>
+            <h2 id="alertsTitle">Alerts</h2>
+          </div>
+          <span id="issueCount" class="review-pill">⚠️ Alerts</span>
+        </div>
+
+        <section class="team-list-section" aria-labelledby="attentionTitle">
+          <div class="section-heading">
+            <h2 id="attentionTitle">Needs Attention</h2>
+          </div>
+          <div id="attentionList" class="team-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <div class="modal-backdrop" id="lunchDialog" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="lunchTitle" aria-describedby="lunchText">
+        <div class="modal-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M4 11h16" />
+            <path d="M5 11l1 8h12l1-8" />
+            <path d="M8 8V5a2 2 0 0 1 4 0v3" />
+            <path d="M13 8V6a2 2 0 0 1 4 0v2" />
+          </svg>
+        </div>
+        <h2 id="lunchTitle">Did you take a 30-minute lunch at this site?</h2>
+        <p id="lunchText">This answer is saved to App Submissions for Google Sheets.</p>
+        <div class="modal-actions">
+          <button class="secondary-button" id="lunchNoButton" type="button">No</button>
+          <button class="primary-button" id="lunchYesButton" type="button">Yes</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="switchDialog" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="switchTitle" aria-describedby="switchText">
+        <div class="modal-icon travel" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M5 17h14" />
+            <path d="M7 17l1.5-7h7L17 17" />
+            <path d="M8 13h8" />
+            <circle cx="8" cy="17" r="2" />
+            <circle cx="16" cy="17" r="2" />
+          </svg>
+        </div>
+        <h2 id="switchTitle">Select new jobsite</h2>
+        <p id="switchText">Choose the location you are in now.</p>
+        <label class="modal-field">
+          Jobsite
+          <select id="switchSiteSelect"></select>
+        </label>
+        <div class="modal-actions">
+          <button class="secondary-button" id="switchCancelButton" type="button">Cancel</button>
+          <button class="primary-button" id="switchConfirmButton" type="button">Start here</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
