@@ -5,6 +5,7 @@ const CONFIG_API_URL = "https://script.google.com/macros/s/AKfycbxCra1iI6QIaMAt3
 let employees = [];
 let sites = [];
 let jobsiteMeta = {};
+let serverSubmissions = [];
 let submissions = [];
 let features = {};
 let state = loadUiState();
@@ -84,15 +85,21 @@ function todayKey(date = new Date()) {
 function loadUiState() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    return { selectedSite: saved.selectedSite || "" };
+    return {
+      selectedSite: saved.selectedSite || "",
+      localSubmissions: normalizeLocalSubmissions(saved.localSubmissions || [])
+    };
   } catch {
     localStorage.removeItem(STORAGE_KEY);
-    return { selectedSite: "" };
+    return { selectedSite: "", localSubmissions: [] };
   }
 }
 
 function saveUiState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ selectedSite: state.selectedSite || "" }));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    selectedSite: state.selectedSite || "",
+    localSubmissions: pruneLocalSubmissions(state.localSubmissions || [])
+  }));
 }
 
 function setup() {
@@ -174,25 +181,54 @@ function normalizeConfig(data) {
     return map;
   }, {});
 
-  submissions = loadedSubmissions.map(normalizeSubmission).filter((row) => row.submissionId);
+  serverSubmissions = loadedSubmissions.map(normalizeSubmission).filter((row) => row.submissionId);
+  mergeSubmissions();
   features = data?.features || {};
 }
 
 function normalizeSubmission(row) {
+  const worker = String(row.worker || "").trim();
   return {
     submissionId: String(row.submissionId || row.id || "").trim(),
     submittedAt: String(row.submittedAt || "").trim(),
-    employeeId: String(row.employeeId || "").trim(),
-    employeeName: String(row.employeeName || "").trim(),
+    employeeId: String(row.employeeId || row.workerId || safeWorkerId(worker) || "").trim(),
+    employeeName: String(row.employeeName || row.name || worker || "").trim(),
     date: String(row.date || "").trim(),
     jobsite: String(row.jobsite || "").trim(),
     startTime: String(row.startTime || "").trim(),
     endTime: String(row.endTime || "").trim(),
     lunch: normalizeLunch(row.lunch),
-    imported: String(row.imported || "").trim(),
+    imported: String(row.imported || row.importStatus || "").trim(),
     importedAt: String(row.importedAt || "").trim(),
-    rowNumber: Number(row.rowNumber || 0)
+    rowNumber: Number(row.rowNumber || 0),
+    localOnly: Boolean(row.localOnly),
+    syncStatus: String(row.syncStatus || "").trim(),
+    error: String(row.error || "").trim(),
+    startIso: String(row.startIso || row.startTime || "").trim(),
+    endIso: String(row.endIso || row.endTime || "").trim(),
+    serverSubmissionId: String(row.serverSubmissionId || "").trim()
   };
+}
+
+function normalizeLocalSubmissions(rows) {
+  if (!Array.isArray(rows)) return [];
+  return pruneLocalSubmissions(rows.map(normalizeSubmission).filter((row) => row.submissionId));
+}
+
+function pruneLocalSubmissions(rows) {
+  const today = todayKey();
+  return rows.filter((row) => row.date === today || !row.endTime);
+}
+
+function mergeSubmissions() {
+  state.localSubmissions = pruneLocalSubmissions(state.localSubmissions || []);
+  submissions = [...serverSubmissions, ...state.localSubmissions];
+}
+
+function updateLocalSubmissions(updater) {
+  state.localSubmissions = pruneLocalSubmissions(updater(state.localSubmissions || []));
+  mergeSubmissions();
+  saveUiState();
 }
 
 function normalizeLunch(value) {
@@ -206,7 +242,7 @@ async function apiGet(action) {
   const response = await fetch(`${CONFIG_API_URL}?action=${encodeURIComponent(action)}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`API request failed: ${response.status}`);
   const data = await response.json();
-  if (data.success === false) throw new Error(data.message || "API request failed");
+  if (data.success === false || data.ok === false) throw new Error(data.message || data.error || "API request failed");
   return data;
 }
 
@@ -219,9 +255,13 @@ async function apiPost(action, payload) {
 
   if (!response.ok) throw new Error(`API request failed: ${response.status}`);
   const data = await response.json();
-  if (data.success === false) throw new Error(data.message || "API request failed");
-  normalizeConfig(data);
+  if (data.success === false || data.ok === false) throw new Error(data.message || data.error || "API request failed");
+  if (hasConfigPayload(data)) normalizeConfig(data);
   return data;
+}
+
+function hasConfigPayload(data) {
+  return Array.isArray(data?.employees) || Array.isArray(data?.jobsites) || Array.isArray(data?.submissions);
 }
 
 function renderSelect(select, options, selectedValue) {
@@ -236,6 +276,14 @@ function initialsFor(name) {
     .slice(0, 2)
     .map((part) => part[0]?.toUpperCase())
     .join("") || "??";
+}
+
+function safeWorkerId(worker) {
+  return String(worker || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function addPinDigit(value) {
@@ -362,16 +410,43 @@ async function clockIn() {
   const jobsite = els.siteSelect.value || state.selectedSite;
   if (!jobsite) return showError("Please select a jobsite.");
 
-  await runSyncedAction(async () => {
-    await apiPost("clockIn", {
-      employeeId: currentUser.id,
-      employeeName: currentUser.name,
-      jobsite
-    });
+  try {
+    const startedAt = new Date();
+    const row = localClockRow(jobsite, startedAt);
+    updateLocalSubmissions((rows) => [row, ...rows.filter((item) => item.employeeId !== currentUser.id || item.endTime)]);
     state.selectedSite = jobsite;
     saveUiState();
-    showToast("Clocked in and synced");
-  });
+    setSyncMessage("Clocked in. Saves at clock out.", false);
+    showToast("Clocked in");
+    render();
+  } catch (error) {
+    console.error(error);
+    showError(error.message ? `Clock In failed. ${error.message}` : "Clock In failed. Please try again.");
+  }
+}
+
+function localClockRow(jobsite, startedAt) {
+  const startIso = startedAt.toISOString();
+  return {
+    submissionId: `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    submittedAt: startIso,
+    employeeId: currentUser.id,
+    employeeName: currentUser.name,
+    date: todayKey(startedAt),
+    jobsite,
+    startTime: startIso,
+    endTime: "",
+    lunch: "",
+    imported: "Local",
+    importedAt: "",
+    rowNumber: Date.now(),
+    localOnly: true,
+    syncStatus: "open",
+    error: "",
+    startIso,
+    endIso: "",
+    serverSubmissionId: ""
+  };
 }
 
 function beginSwitchJobsite() {
@@ -410,6 +485,12 @@ async function clockOut(submissionId, lunch) {
   if (!current) {
     closeLunchDialog();
     return showError("No open row found. You are already clocked out.");
+  }
+
+  if (current.localOnly) {
+    closeLunchDialog();
+    await completeLocalShift(current, lunch);
+    return;
   }
 
   await runSyncedAction(async () => {
@@ -452,6 +533,12 @@ async function confirmSwitchJobsite() {
   if (!nextJobsite) return showError("Please select the new jobsite.");
   if (nextJobsite === current.jobsite) return showError("Select a different jobsite.");
 
+  if (current.localOnly) {
+    closeSwitchDialog();
+    await completeLocalShift(current, pendingSwitchLunch, nextJobsite);
+    return;
+  }
+
   await runSyncedAction(async () => {
     await apiPost("switchJobsite", {
       employeeId: currentUser.id,
@@ -464,6 +551,76 @@ async function confirmSwitchJobsite() {
     closeSwitchDialog();
     showToast("Jobsite switched and synced");
   });
+}
+
+async function completeLocalShift(current, lunch, nextJobsite = "") {
+  const endedAt = new Date();
+  const completed = {
+    ...current,
+    endTime: endedAt.toISOString(),
+    lunch,
+    syncStatus: "pending",
+    error: "",
+    endIso: endedAt.toISOString()
+  };
+  const nextOpen = nextJobsite ? localClockRow(nextJobsite, endedAt) : null;
+
+  updateLocalSubmissions((rows) => {
+    const withoutCurrent = rows.filter((row) => row.submissionId !== current.submissionId);
+    return nextOpen ? [nextOpen, completed, ...withoutCurrent] : [completed, ...withoutCurrent];
+  });
+  if (nextJobsite) {
+    state.selectedSite = nextJobsite;
+    saveUiState();
+  }
+
+  setProcessing(true);
+  setSyncMessage("Saving completed shift...", false);
+  try {
+    const saved = await saveCompletedShift(completed);
+    updateLocalSubmissions((rows) => rows.map((row) => row.submissionId === completed.submissionId
+      ? { ...row, syncStatus: "saved", serverSubmissionId: saved.submissionId || "", error: "" }
+      : row
+    ));
+    setSyncMessage("Synced", false);
+    showToast(nextJobsite ? "Jobsite switched" : "Clocked out and synced");
+  } catch (error) {
+    console.error(error);
+    updateLocalSubmissions((rows) => rows.map((row) => row.submissionId === completed.submissionId
+      ? { ...row, syncStatus: "failed", error: error.message || "Save failed" }
+      : row
+    ));
+    showError(error.message ? `Not synced. ${error.message}` : "Not synced. Completed shift kept on this device.");
+  } finally {
+    setProcessing(false);
+    render();
+  }
+}
+
+async function saveCompletedShift(row) {
+  const token = await ensureSessionToken();
+  return apiPost("saveShift", {
+    token,
+    shift: {
+      clientShiftId: row.submissionId,
+      worker: currentUser.name,
+      date: row.date,
+      jobsite: row.jobsite,
+      startIso: row.startIso || row.startTime,
+      endIso: row.endIso || row.endTime,
+      lunch: row.lunch,
+      notes: ""
+    }
+  });
+}
+
+async function ensureSessionToken() {
+  if (currentUser?.sessionToken) return currentUser.sessionToken;
+  const data = await apiPost("login", { pin: currentUser.pin });
+  if (!data.token) throw new Error("Session could not be verified. Please log out and sign in again.");
+  currentUser.sessionToken = data.token;
+  currentUser.expiresAt = data.expiresAt || "";
+  return currentUser.sessionToken;
 }
 
 async function runSyncedAction(callback) {
