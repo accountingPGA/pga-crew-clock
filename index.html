@@ -4,15 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f7f8fa" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Crew Clock" />
     <title>Pinnacle Crew Clock</title>
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="icon" type="image/png" sizes="16x16" href="./assets/favicon-16x16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/favicon-32x32.png" />
+    <link rel="icon" href="./assets/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/apple-touch-icon.png" />
+    <link rel="preload" href="./assets/pinnacle-logo.png" as="image" />
+    <link rel="preload" href="./assets/splash-logo.png" as="image" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <section class="login-screen" id="loginScreen" aria-label="Crew Clock Login">
       <div class="login-card">
         <div class="login-brand">
-          <img class="brand-mark" src="./assets/brand-mark.svg" alt="" onerror="this.style.display='none'" />
-          <p class="eyebrow">Pinnacle Glass and Aluminum Ltd.</p>
+          <img class="login-logo" src="./assets/pinnacle-logo.png" alt="Pinnacle Glass and Aluminum" />
           <h1>Crew Clock</h1>
         </div>
 
@@ -44,7 +53,7 @@
     <main class="app-shell app-hidden" id="appShell" aria-label="Crew Clock">
       <header class="app-header">
         <div class="brand-lockup">
-          <img class="brand-mark" src="./assets/brand-mark.svg" alt="" onerror="this.style.display='none'" />
+          <img class="brand-mark" src="./assets/icon-192.png" alt="" onerror="this.style.display='none'" />
           <div>
             <p class="eyebrow">Pinnacle Glass and Aluminum Ltd.</p>
             <h1>Crew Clock</h1>
