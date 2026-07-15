@@ -145,10 +145,11 @@ async function apiGet(action) {
 
 async function apiPost(action, payload = {}) {
   if (!apiReady()) throw new Error("Add the Apps Script Web App URL in index.html.");
+  const body = new URLSearchParams();
+  body.set("payload", JSON.stringify({ action, ...payload }));
   const response = await fetch(CONFIG.apiUrl, {
     method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action, ...payload }),
+    body,
   });
   return parseApiResponse(response);
 }
