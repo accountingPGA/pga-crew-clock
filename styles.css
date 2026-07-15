@@ -667,6 +667,26 @@ textarea {
   align-items: center;
 }
 
+.person-status-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-end;
+}
+
+.switch-indicator {
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #eef4ff;
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 820;
+  white-space: nowrap;
+}
+
 .entry-title,
 .person-name {
   display: block;
@@ -701,6 +721,54 @@ textarea {
 .person-card {
   grid-template-columns: 42px minmax(0, 1fr);
   border-left-color: var(--row-site-color, var(--blue));
+}
+
+.transfer-person {
+  display: block;
+  padding: 0;
+}
+
+.person-summary {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  padding: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.person-summary::-webkit-details-marker {
+  display: none;
+}
+
+.person-summary::marker {
+  content: "";
+}
+
+.transfer-history {
+  display: grid;
+  gap: 8px;
+  margin: 0 12px 12px 66px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.transfer-event {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.transfer-event strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .alert-section {

@@ -9,6 +9,7 @@ const API_PLACEHOLDER = "PASTE_APPS_SCRIPT_WEB_APP_URL_HERE";
 const VAPID_PLACEHOLDER = "PASTE_WEB_PUSH_VAPID_PUBLIC_KEY_HERE";
 const APP_TIME_ZONE = "America/Vancouver";
 const OPERATIONS_REFRESH_MS = 30000;
+const STILL_CLOCKED_IN_ALERT_TIME = "17:30";
 const SESSION_EXPIRED_SAVE_MESSAGE = "Your session expired. Please sign in again. Your shift is still saved on this phone.";
 
 const els = {
@@ -23,6 +24,7 @@ const els = {
   connectionBar: document.querySelector("#connectionBar"),
   connectionText: document.querySelector("#connectionText"),
   managerTabs: document.querySelector("#managerTabs"),
+  alertsTab: document.querySelector('[data-tab="alerts"]'),
   tabs: document.querySelectorAll(".tab"),
   views: document.querySelectorAll(".view"),
   refreshButton: document.querySelector("#refreshButton"),
@@ -69,6 +71,7 @@ let payroll = {
   jobsites: [],
   absences: [],
   clockStates: [],
+  submissions: [],
   loadedAt: null,
 };
 
@@ -277,6 +280,7 @@ async function loadBootstrap(options = {}) {
       jobsites: arrayOrEmpty(data.jobsites),
       absences: arrayOrEmpty(data.absences),
       clockStates: arrayOrEmpty(data.clockStates),
+      submissions: arrayOrEmpty(data.submissions),
       loadedAt: new Date().toISOString(),
     };
     const employee = currentEmployee();
@@ -799,11 +803,22 @@ function renderShell() {
   const manager = isManagerMode();
   els.managerTabs.hidden = !manager;
   if (!manager) state.activeTab = "clock";
+  renderAlertsTabIndicator();
   els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
   els.views.forEach((view) => {
     const key = view.id.replace("View", "");
     view.classList.toggle("active", key === state.activeTab || (!manager && key === "clock"));
   });
+}
+
+function renderAlertsTabIndicator() {
+  if (!els.alertsTab) return;
+  if (!isManagerMode()) {
+    els.alertsTab.textContent = "Alerts";
+    return;
+  }
+  const count = alertItemCount(buildAlertSections());
+  els.alertsTab.textContent = count ? `Alerts 🔴 ${count}` : "Alerts";
 }
 
 function renderClock() {
@@ -961,7 +976,9 @@ function buildOperationsGroups(absentWorkers) {
       jobsite: stateRow.jobsite,
       start: stateRow.clockInAt,
     } : null);
-    const recent = state.shifts.find((shift) => shift.worker === employee.worker);
+    const activeForHistory = active || null;
+    const recent = latestCompletedSegmentFor(employee.worker);
+    const transferHistory = transferHistoryFor(employee.worker, activeForHistory);
     const absent = absentWorkers.has(employee.worker);
     const clockedOut = !!recent || stateRow?.status === "Clocked Out";
 
@@ -992,6 +1009,8 @@ function buildOperationsGroups(absentWorkers) {
       status: active ? "Clocked In" : "Clocked Out",
       statusClass: active ? "" : "out",
       clockIn: active?.start || recent?.start || stateRow?.clockInAt || "",
+      switched: transferHistory.length > 0,
+      transferHistory,
     });
   });
 
@@ -1020,24 +1039,140 @@ function renderOperationsGroup(group) {
 }
 
 function renderOperationsPerson(person) {
+  const content = `
+    <div class="avatar">${escapeHtml(initials(person.worker))}</div>
+    <div class="person-main">
+      <div>
+        <span class="person-name">${escapeHtml(person.worker)}</span>
+        ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
+      </div>
+      <span class="person-status-stack">
+        <span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>
+        ${person.switched ? `<span class="switch-indicator">↔ Switched</span>` : ""}
+      </span>
+    </div>
+  `;
+  if (person.switched) {
+    return `
+      <details class="person-card transfer-person">
+        <summary class="person-summary">${content}</summary>
+        ${renderTransferHistory(person.transferHistory)}
+      </details>
+    `;
+  }
   return `
     <article class="person-card">
-      <div class="avatar">${escapeHtml(initials(person.worker))}</div>
-      <div class="person-main">
-        <div>
-          <span class="person-name">${escapeHtml(person.worker)}</span>
-          ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
-        </div>
-        <span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>
-      </div>
+      ${content}
     </article>
   `;
+}
+
+function renderTransferHistory(transfers) {
+  return `
+    <div class="transfer-history">
+      ${transfers.map((transfer) => `
+        <div class="transfer-event">
+          <span>${transfer.transferTime ? timeLabel(transfer.transferTime) : "Transfer"}</span>
+          <strong>${escapeHtml(transfer.previousJobsite)} → ${escapeHtml(transfer.currentJobsite)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function latestCompletedSegmentFor(worker) {
+  const segments = completedSegmentsFor(worker);
+  return segments.length ? segments[segments.length - 1] : null;
+}
+
+function transferHistoryFor(worker, active) {
+  const segments = completedSegmentsFor(worker);
+  if (active?.jobsite) {
+    segments.push({
+      worker,
+      jobsite: active.jobsite,
+      start: active.start || "",
+      end: "",
+      current: true,
+    });
+  }
+  segments.sort(compareSegments);
+
+  const transfers = [];
+  for (let index = 1; index < segments.length; index += 1) {
+    const previous = segments[index - 1];
+    const current = segments[index];
+    if (keyForCompare(previous.jobsite) && keyForCompare(current.jobsite) && keyForCompare(previous.jobsite) !== keyForCompare(current.jobsite)) {
+      transfers.push({
+        previousJobsite: previous.jobsite,
+        transferTime: current.start || previous.end || "",
+        currentJobsite: current.jobsite,
+      });
+    }
+  }
+  return transfers;
+}
+
+function completedSegmentsFor(worker) {
+  const segments = [];
+  payroll.submissions
+    .filter((row) => row.worker === worker && row.date === todayKey())
+    .forEach((row) => {
+      segments.push({
+        sourceId: row.submissionId || "",
+        worker: row.worker,
+        jobsite: row.jobsite,
+        start: row.clockInAt,
+        end: row.clockOutAt,
+      });
+    });
+  state.shifts
+    .filter((shift) => shift.worker === worker && localDateKey(new Date(shift.start)) === todayKey())
+    .forEach((shift) => {
+      segments.push({
+        sourceId: shift.id,
+        worker: shift.worker,
+        jobsite: shift.jobsite,
+        start: shift.start,
+        end: shift.end,
+      });
+    });
+  return dedupeSegments(segments).sort(compareSegments);
+}
+
+function dedupeSegments(segments) {
+  const seen = new Set();
+  return segments.filter((segment) => {
+    if (!segment.worker || !segment.jobsite || !segment.start) return false;
+    const key = [
+      keyForCompare(segment.worker),
+      keyForCompare(segment.jobsite),
+      segment.start || "",
+      segment.end || "",
+    ].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function compareSegments(a, b) {
+  return segmentTimeValue(a) - segmentTimeValue(b);
+}
+
+function segmentTimeValue(segment) {
+  const value = Date.parse(segment.start || segment.end || "");
+  return Number.isNaN(value) ? 0 : value;
+}
+
+function keyForCompare(value) {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function renderAlerts() {
   const sections = buildAlertSections().filter((section) => section.people.length);
   if (!sections.length) {
-    els.alertsList.innerHTML = `<p class="empty-state">No attendance or save issues right now.</p>`;
+    els.alertsList.innerHTML = `<p class="empty-state">✓ Everyone is accounted for today.</p>`;
     return;
   }
 
@@ -1067,7 +1202,7 @@ function buildAlertSections() {
 
   return [
     {
-      title: "Not Clocked In",
+      title: "🔴 Not Clocked In",
       people: payroll.employees
         .filter((employee) => attendanceRequiredFor(employee.worker))
         .filter((employee) => !hasClockedInToday(employee.worker) && !absentWorkers.has(employee.worker))
@@ -1079,7 +1214,7 @@ function buildAlertSections() {
         .sort(compareAlertPeople),
     },
     {
-      title: "Absent Today",
+      title: "🟢 Absent Today",
       people: [...absentWorkers]
         .map((worker) => ({
           worker,
@@ -1089,11 +1224,11 @@ function buildAlertSections() {
         .sort(compareAlertPeople),
     },
     {
-      title: "Still Clocked In",
-      people: [...activeMap.values()].sort(compareAlertPeople),
+      title: "🔴 Still Clocked In (after the final reminder time only)",
+      people: isAfterStillClockedInAlertTime() ? [...activeMap.values()].sort(compareAlertPeople) : [],
     },
     {
-      title: "Save Problems",
+      title: "🔴 Save Problems",
       people: failed.concat(pending)
         .map((shift) => ({
           worker: shift.worker,
@@ -1104,6 +1239,10 @@ function buildAlertSections() {
         .sort(compareAlertPeople),
     },
   ];
+}
+
+function alertItemCount(sections) {
+  return sections.reduce((total, section) => total + section.people.length, 0);
 }
 
 function compareAlertPeople(a, b) {
@@ -1191,6 +1330,30 @@ function timeLabel(iso) {
     minute: "2-digit",
     timeZone: APP_TIME_ZONE,
   }).format(new Date(iso));
+}
+
+function isAfterStillClockedInAlertTime(date = new Date()) {
+  return localMinutesOfDay(date) >= minutesFromTime(STILL_CLOCKED_IN_ALERT_TIME);
+}
+
+function localMinutesOfDay(date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .formatToParts(date)
+    .reduce((memo, part) => {
+      memo[part.type] = part.value;
+      return memo;
+    }, {});
+  return (Number(parts.hour) % 24) * 60 + Number(parts.minute);
+}
+
+function minutesFromTime(hhmm) {
+  const [hours, minutes] = hhmm.split(":").map(Number);
+  return hours * 60 + minutes;
 }
 
 function travelLabel(shift) {
