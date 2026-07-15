@@ -96,6 +96,7 @@ function defaultState() {
     activeShifts: {},
     shifts: [],
     absenceDate: "",
+    expandedTransfers: {},
     notificationEndpoint: "",
     reminderStatus: "",
     activeTab: "clock",
@@ -109,7 +110,7 @@ function loadState() {
   try {
     const parsed = JSON.parse(saved);
     if (parsed.day === todayKey()) {
-      return { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {} };
+      return { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedTransfers: parsed.expandedTransfers || {} };
     }
   } catch {
     localStorage.removeItem(STORAGE_KEY);
@@ -392,6 +393,22 @@ function restoreCurrentOpenShift() {
 function hasClockedInToday(worker = currentWorker()) {
   const status = clockStateFor(worker)?.status;
   return !!activeShiftFor(worker) || completedRowsFor(worker).length > 0 || status === "Clocked In" || status === "Clocked Out";
+}
+
+function hasAttendanceClockInToday(worker) {
+  const status = clockStateFor(worker)?.status;
+  return status === "Clocked In"
+    || status === "Clocked Out"
+    || !!activeShiftFor(worker)
+    || payroll.submissions.some((row) => row.worker === worker && row.date === todayKey())
+    || state.shifts.some((shift) => shift.worker === worker && localDateKey(new Date(shift.start)) === todayKey());
+}
+
+function activeAttendanceEmployees() {
+  return payroll.employees.filter((employee) => {
+    const status = String(employee.status || "Active").toLowerCase();
+    return employee.worker && status === "active" && attendanceRequiredFor(employee.worker);
+  });
 }
 
 function clockStateFor(worker = currentWorker()) {
@@ -958,6 +975,7 @@ function renderOperations() {
   els.teamList.innerHTML = groups.length
     ? groups.map(renderOperationsGroup).join("")
     : `<p class="empty-state">No clocked-in, clocked-out, or absent employees today</p>`;
+  bindTransferExpansionState();
 }
 
 function buildOperationsGroups(absentWorkers) {
@@ -1053,8 +1071,9 @@ function renderOperationsPerson(person) {
     </div>
   `;
   if (person.switched) {
+    const open = isTransferExpanded(person.worker) ? " open" : "";
     return `
-      <details class="person-card transfer-person">
+      <details class="person-card transfer-person" data-worker="${escapeHtml(person.worker)}"${open}>
         <summary class="person-summary">${content}</summary>
         ${renderTransferHistory(person.transferHistory)}
       </details>
@@ -1065,6 +1084,25 @@ function renderOperationsPerson(person) {
       ${content}
     </article>
   `;
+}
+
+function bindTransferExpansionState() {
+  els.teamList.querySelectorAll(".transfer-person").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const worker = details.dataset.worker || "";
+      if (!worker) return;
+      if (details.open) {
+        state.expandedTransfers[worker] = true;
+      } else {
+        delete state.expandedTransfers[worker];
+      }
+      saveState();
+    });
+  });
+}
+
+function isTransferExpanded(worker) {
+  return !!state.expandedTransfers?.[worker];
 }
 
 function renderTransferHistory(transfers) {
@@ -1203,9 +1241,8 @@ function buildAlertSections() {
   return [
     {
       title: "🔴 Not Clocked In",
-      people: payroll.employees
-        .filter((employee) => attendanceRequiredFor(employee.worker))
-        .filter((employee) => !hasClockedInToday(employee.worker) && !absentWorkers.has(employee.worker))
+      people: activeAttendanceEmployees()
+        .filter((employee) => !hasAttendanceClockInToday(employee.worker) && !absentWorkers.has(employee.worker))
         .map((employee) => ({
           worker: employee.worker,
           status: "Not Clocked In",
