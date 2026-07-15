@@ -1,8 +1,8 @@
 const CONFIG = {
-  apiUrl: window.CREW_CLOCK_CONFIG?.apiUrl || "",
-  vapidPublicKey: window.CREW_CLOCK_CONFIG?.vapidPublicKey || "",
-  fcmVapidKey: window.CREW_CLOCK_CONFIG?.fcmVapidKey || window.CREW_CLOCK_CONFIG?.vapidPublicKey || "",
-  firebaseConfig: window.CREW_CLOCK_CONFIG?.firebaseConfig || null,
+  apiUrl: normalizeConfigText(window.CREW_CLOCK_CONFIG?.apiUrl || ""),
+  vapidPublicKey: normalizeConfigText(window.CREW_CLOCK_CONFIG?.vapidPublicKey || ""),
+  fcmVapidKey: normalizeConfigText(window.CREW_CLOCK_CONFIG?.fcmVapidKey || window.CREW_CLOCK_CONFIG?.vapidPublicKey || ""),
+  firebaseConfig: normalizeFirebaseConfig(window.CREW_CLOCK_CONFIG?.firebaseConfig || null),
 };
 
 const STORAGE_KEY = "pga-crew-clock-payroll-v2";
@@ -377,6 +377,65 @@ function hasFcmConfig() {
 function hasRealConfigValue(value) {
   const text = String(value || "").trim();
   return !!text && !/^(PASTE|YOUR|FIREBASE)_/i.test(text);
+}
+
+function normalizeConfigText(value) {
+  return String(value || "").trim().replace(/[\u2010-\u2015\u2212]/g, "-");
+}
+
+function normalizeFirebaseConfig(config) {
+  if (!config || typeof config !== "object") return null;
+  return {
+    apiKey: normalizeConfigText(config.apiKey),
+    authDomain: normalizeConfigText(config.authDomain),
+    projectId: normalizeConfigText(config.projectId),
+    messagingSenderId: normalizeConfigText(config.messagingSenderId),
+    appId: normalizeConfigText(config.appId),
+  };
+}
+
+function pushDiagnostics(registration = serviceWorkerRegistration) {
+  const vapidBytes = publicKeyByteLength(CONFIG.vapidPublicKey);
+  const fcmBytes = publicKeyByteLength(CONFIG.fcmVapidKey);
+  const diagnostics = {
+    vapidPublicKey: CONFIG.vapidPublicKey,
+    fcmVapidKey: CONFIG.fcmVapidKey,
+    vapidPublicKeyLength: CONFIG.vapidPublicKey.length,
+    fcmVapidKeyLength: CONFIG.fcmVapidKey.length,
+    vapidPublicKeyBytes: vapidBytes,
+    fcmVapidKeyBytes: fcmBytes,
+    firebaseConfigReady: hasFcmConfig(),
+    firebaseSdkLoaded: !!(window.firebase?.initializeApp && window.firebase?.messaging),
+    serviceWorkerScope: registration?.scope || "",
+    serviceWorkerScript: registration?.active?.scriptURL || registration?.waiting?.scriptURL || registration?.installing?.scriptURL || "",
+  };
+  console.info("PGA Crew Clock push diagnostics", diagnostics);
+  return diagnostics;
+}
+
+function pushDiagnosticsSummary(diagnostics) {
+  return [
+    `vapid ${diagnostics.vapidPublicKeyLength}/bytes ${diagnostics.vapidPublicKeyBytes}`,
+    `fcm ${diagnostics.fcmVapidKeyLength}/bytes ${diagnostics.fcmVapidKeyBytes}`,
+    `firebase config ${diagnostics.firebaseConfigReady ? "ok" : "missing"}`,
+    `sdk ${diagnostics.firebaseSdkLoaded ? "loaded" : "not loaded"}`,
+  ].join("; ");
+}
+
+function publicKeyByteLength(value) {
+  try {
+    return urlBase64ToUint8Array(normalizeConfigText(value)).byteLength;
+  } catch {
+    return 0;
+  }
+}
+
+function assertValidP256PublicKey(value, label) {
+  const text = normalizeConfigText(value);
+  const bytes = publicKeyByteLength(text);
+  if (text.length !== 87 || bytes !== 65) {
+    throw new Error(`${label} must be 87 characters and decode to 65 bytes. Runtime value is ${text.length} characters and ${bytes} bytes.`);
+  }
 }
 
 function currentActiveShift() {
@@ -787,6 +846,26 @@ async function enableClockReminders() {
     render();
     return;
   }
+  try {
+    assertValidP256PublicKey(CONFIG.vapidPublicKey, "vapidPublicKey");
+    assertValidP256PublicKey(CONFIG.fcmVapidKey, "fcmVapidKey");
+  } catch (error) {
+    const diagnostics = pushDiagnostics();
+    state.reminderStatus = `${error.message || error}. ${pushDiagnosticsSummary(diagnostics)}`;
+    saveState();
+    render();
+    return;
+  }
+  let diagnostics = pushDiagnostics();
+  state.reminderStatus = `Checking push setup: ${pushDiagnosticsSummary(diagnostics)}`;
+  saveState();
+  render();
+  if (!hasFcmConfig()) {
+    state.reminderStatus = `Firebase messaging config is incomplete. ${pushDiagnosticsSummary(diagnostics)}`;
+    saveState();
+    render();
+    return;
+  }
 
   const permission = await Notification.requestPermission();
   if (permission !== "granted") {
@@ -797,36 +876,34 @@ async function enableClockReminders() {
   }
 
   try {
-    const registration = serviceWorkerRegistration || await navigator.serviceWorker.register("./service-worker.js");
-    if (hasFcmConfig()) {
-      await enableFcmReminders(registration);
-    } else {
-      await enableNativeWebPushReminders(registration);
-    }
+    await navigator.serviceWorker.register("./service-worker.js");
+    const registration = await navigator.serviceWorker.ready;
+    serviceWorkerRegistration = registration;
+    await enableFcmReminders(registration);
 
     state.reminderStatus = "Clock reminders enabled on this device.";
     saveState();
     render();
     showToast("Clock reminders enabled");
   } catch (error) {
-    state.reminderStatus = error.message || "Could not enable reminders.";
+    diagnostics = pushDiagnostics(serviceWorkerRegistration);
+    state.reminderStatus = `FCM setup failed: ${error.message || error}. ${pushDiagnosticsSummary(diagnostics)}`;
     saveState();
     render();
   }
 }
 
 async function enableFcmReminders(registration) {
-  const [{ initializeApp, getApp, getApps }, { getMessaging, getToken, isSupported }] = await Promise.all([
-    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
-    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-messaging.js`),
-  ]);
-  if (isSupported && !(await isSupported())) {
+  if (!window.firebase?.initializeApp || !window.firebase?.messaging) {
+    throw new Error(`Firebase SDK scripts did not load before app.js. Expected firebase-app-compat.js and firebase-messaging-compat.js ${FIREBASE_SDK_VERSION}.`);
+  }
+  if (window.firebase.messaging.isSupported && !(await window.firebase.messaging.isSupported())) {
     throw new Error("Clock reminders are not supported on this browser.");
   }
 
-  const firebaseApp = getApps().length ? getApp() : initializeApp(CONFIG.firebaseConfig);
-  const messaging = getMessaging(firebaseApp);
-  const fcmToken = await getToken(messaging, {
+  if (!window.firebase.apps?.length) window.firebase.initializeApp(CONFIG.firebaseConfig);
+  const messaging = window.firebase.messaging();
+  const fcmToken = await messaging.getToken({
     vapidKey: CONFIG.fcmVapidKey,
     serviceWorkerRegistration: registration,
   });
