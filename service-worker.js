@@ -1,4 +1,4 @@
-const CACHE_NAME = "pga-crew-clock-v4";
+const CACHE_NAME = "pga-crew-clock-v5";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -39,10 +39,14 @@ self.addEventListener("push", (event) => {
     payload = {};
   }
 
-  const title = payload.title || "PGA Crew Clock";
-  const body = payload.body || "Tap to open Crew Clock.";
-  const url = payload.url || "./index.html";
-  const tag = payload.tag || "pga-crew-clock-reminder";
+  const notification = payload.notification || {};
+  const data = payload.data || {};
+  const webpush = payload.webpush || {};
+  const fcmOptions = payload.fcmOptions || webpush.fcm_options || webpush.fcmOptions || {};
+  const title = notification.title || payload.title || data.title || "PGA Crew Clock";
+  const body = notification.body || payload.body || data.body || "Tap to open Crew Clock.";
+  const url = fcmOptions.link || notification.click_action || payload.url || data.url || "./index.html";
+  const tag = notification.tag || payload.tag || data.tag || "pga-crew-clock-reminder";
 
   event.waitUntil(
     self.registration.showNotification(title, {

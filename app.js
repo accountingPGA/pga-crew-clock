@@ -1,6 +1,8 @@
 const CONFIG = {
   apiUrl: window.CREW_CLOCK_CONFIG?.apiUrl || "",
   vapidPublicKey: window.CREW_CLOCK_CONFIG?.vapidPublicKey || "",
+  fcmVapidKey: window.CREW_CLOCK_CONFIG?.fcmVapidKey || window.CREW_CLOCK_CONFIG?.vapidPublicKey || "",
+  firebaseConfig: window.CREW_CLOCK_CONFIG?.firebaseConfig || null,
 };
 
 const STORAGE_KEY = "pga-crew-clock-payroll-v2";
@@ -11,6 +13,7 @@ const APP_TIME_ZONE = "America/Vancouver";
 const OPERATIONS_REFRESH_MS = 30000;
 const STILL_CLOCKED_IN_ALERT_TIME = "17:30";
 const SESSION_EXPIRED_SAVE_MESSAGE = "Your session expired. Please sign in again. Your shift is still saved on this phone.";
+const FIREBASE_SDK_VERSION = "10.13.2";
 
 const els = {
   loginScreen: document.querySelector("#loginScreen"),
@@ -360,6 +363,22 @@ function isManagerMode() {
   return ["admin", "manager", "supervisor", "foreman", "lead", "operations", "office"].some((word) => role.includes(word));
 }
 
+function canEnableDeviceNotifications() {
+  return attendanceRequiredFor() || isManagerMode();
+}
+
+function hasFcmConfig() {
+  const config = CONFIG.firebaseConfig;
+  return !!config
+    && ["apiKey", "projectId", "messagingSenderId", "appId"].every((key) => hasRealConfigValue(config[key]))
+    && hasRealConfigValue(CONFIG.fcmVapidKey);
+}
+
+function hasRealConfigValue(value) {
+  const text = String(value || "").trim();
+  return !!text && !/^(PASTE|YOUR|FIREBASE)_/i.test(text);
+}
+
 function currentActiveShift() {
   return state.activeShifts[currentWorker()] || null;
 }
@@ -683,11 +702,27 @@ async function saveCompletedShift(shift) {
       return;
     }
     updateShiftSync(shift.id, { syncStatus: "failed", error: error.message });
+    await notifySaveProblem(shift, error);
     state.lastSync = "Save failed, try again";
     saveState();
     setConnection("error", "Save failed, try again");
   } finally {
     render();
+  }
+}
+
+async function notifySaveProblem(shift, error) {
+  const latest = state.shifts.find((item) => item.id === shift.id) || shift;
+  if (!state.auth?.token || latest.saveProblemNotified) return;
+  try {
+    await apiPost("notifySaveProblem", {
+      token: state.auth.token,
+      shift: toSubmissionPayload(latest),
+      error: error?.message || "Save failed, retry needed.",
+    });
+    updateShiftSync(shift.id, { saveProblemNotified: true });
+  } catch {
+    // The failed shift remains queued locally; this notification is best-effort.
   }
 }
 
@@ -734,8 +769,8 @@ async function registerServiceWorker() {
 }
 
 async function enableClockReminders() {
-  if (!attendanceRequiredFor()) {
-    state.reminderStatus = "Reminders are off for this worker.";
+  if (!canEnableDeviceNotifications()) {
+    state.reminderStatus = "Notifications are off for this worker.";
     saveState();
     render();
     return;
@@ -763,19 +798,12 @@ async function enableClockReminders() {
 
   try {
     const registration = serviceWorkerRegistration || await navigator.serviceWorker.register("./service-worker.js");
-    const existing = await registration.pushManager.getSubscription();
-    const subscription = existing || await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(CONFIG.vapidPublicKey),
-    });
+    if (hasFcmConfig()) {
+      await enableFcmReminders(registration);
+    } else {
+      await enableNativeWebPushReminders(registration);
+    }
 
-    await apiPost("registerPushSubscription", {
-      token: state.auth?.token,
-      subscription: subscription.toJSON(),
-      userAgent: navigator.userAgent,
-    });
-
-    state.notificationEndpoint = subscription.endpoint;
     state.reminderStatus = "Clock reminders enabled on this device.";
     saveState();
     render();
@@ -785,6 +813,48 @@ async function enableClockReminders() {
     saveState();
     render();
   }
+}
+
+async function enableFcmReminders(registration) {
+  const [{ initializeApp, getApp, getApps }, { getMessaging, getToken, isSupported }] = await Promise.all([
+    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
+    import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-messaging.js`),
+  ]);
+  if (isSupported && !(await isSupported())) {
+    throw new Error("Clock reminders are not supported on this browser.");
+  }
+
+  const firebaseApp = getApps().length ? getApp() : initializeApp(CONFIG.firebaseConfig);
+  const messaging = getMessaging(firebaseApp);
+  const fcmToken = await getToken(messaging, {
+    vapidKey: CONFIG.fcmVapidKey,
+    serviceWorkerRegistration: registration,
+  });
+  if (!fcmToken) throw new Error("Could not create a Firebase notification token.");
+
+  await apiPost("registerPushSubscription", {
+    token: state.auth?.token,
+    pushProvider: "fcm",
+    fcmToken,
+    userAgent: navigator.userAgent,
+  });
+  state.notificationEndpoint = `fcm:${fcmToken.slice(-16)}`;
+}
+
+async function enableNativeWebPushReminders(registration) {
+  const existing = await registration.pushManager.getSubscription();
+  const subscription = existing || await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(CONFIG.vapidPublicKey),
+  });
+
+  await apiPost("registerPushSubscription", {
+    token: state.auth?.token,
+    pushProvider: "webpush",
+    subscription: subscription.toJSON(),
+    userAgent: navigator.userAgent,
+  });
+  state.notificationEndpoint = subscription.endpoint;
 }
 
 function toSubmissionPayload(shift) {
@@ -938,20 +1008,23 @@ function renderCompletedRows(rows) {
 }
 
 function renderReminderPanel() {
-  const required = attendanceRequiredFor();
-  els.reminderPanel.hidden = !required;
-  if (!required) return;
+  const canEnable = canEnableDeviceNotifications();
+  els.reminderPanel.hidden = !canEnable;
+  if (!canEnable) return;
 
   const permission = "Notification" in window ? Notification.permission : "unsupported";
   const enabled = permission === "granted" && !!state.notificationEndpoint;
   els.enableRemindersButton.disabled = enabled;
-  els.enableRemindersButton.textContent = enabled ? "Clock Reminders Enabled" : "Enable Clock Reminders";
+  const buttonLabel = attendanceRequiredFor() ? "Clock Reminders" : "Manager Notifications";
+  els.enableRemindersButton.textContent = enabled ? `${buttonLabel} Enabled` : `Enable ${buttonLabel}`;
   if (state.reminderStatus) {
     els.remindersStatus.textContent = state.reminderStatus;
   } else if (permission === "denied") {
     els.remindersStatus.textContent = "Notifications are blocked in this browser.";
   } else {
-    els.remindersStatus.textContent = "Tap once on this device to receive clock reminders.";
+    els.remindersStatus.textContent = attendanceRequiredFor()
+      ? "Tap once on this device to receive clock reminders."
+      : "Tap once on this device to receive manager notifications.";
   }
 }
 

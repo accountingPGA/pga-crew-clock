@@ -13,8 +13,18 @@
       window.CREW_CLOCK_CONFIG = {
         // Paste the Apps Script Web App URL after deploying CrewClockBackend.gs.
         apiUrl: "https://script.google.com/macros/s/AKfycbxCra1iI6QIaMAt3JT3ZB1Wlkp24nkQRxUbUbORRJ5d53kVBqfb44KCNl17FIDqUPC9/exec",
-        // Required for real push subscriptions on iPhone and Android PWAs.
-        vapidPublicKey: "BD-c7u13VWKTjGRJabSz6NfuBGEhaQm5pbjAjQ13XEyzqDqS3Pr9eIApZ2pD4ahXqI12OWzjhScdbuRaspG93eU"
+        // Public Web Push certificate key from Firebase Cloud Messaging.
+        vapidPublicKey: "BECz57bHL4BalayFqYjb9GId8ItNoO7q3gpXchGf8HMUQZ-RY2QsAEqTaQHWqIHkURflcgV2svmbVcWWH2vprCg",
+        // Paste the public Firebase Web App config from Project settings > General.
+        firebaseConfig: {
+          apiKey: "AIzaSyBjdkUmYozJGpkEud4JXXmC0peR5FD5Jd0",
+          authDomain: "pga-crew-clock-push.firebaseapp.com",
+          projectId: "pga-crew-clock-push",
+          messagingSenderId: "27814810624",
+          appId: "1:27814810624:web:ed2d88b3af8010e70434e5"
+        },
+        // This is public. It should match the Firebase Web Push certificate public key.
+        fcmVapidKey: "BECz57bHL4BalayFqYjb9GId8ItNoO7q3gpXchGf8HMUQZ-RY2QsAEqTaQHWqIHkURflcgV2svmbVcWWH2vprCg"
       };
     </script>
   </head>
@@ -255,6 +265,6 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-    <script src="./app.js?v=20260715-login-post-fix"></script>
+    <script src="./app.js?v=20260715-fcm-push"></script>
   </body>
 </html>
