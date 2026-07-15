@@ -1,4 +1,4 @@
-const CACHE_NAME = "pga-crew-clock-v5";
+const CACHE_NAME = "pga-crew-clock-v6";
 const APP_SHELL = [
   "./",
   "./index.html",
