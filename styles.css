@@ -647,6 +647,7 @@ textarea {
 
 .entry-card,
 .person-card,
+.alert-person,
 .alert-card {
   display: grid;
   gap: 8px;
@@ -700,6 +701,52 @@ textarea {
 .person-card {
   grid-template-columns: 42px minmax(0, 1fr);
   border-left-color: var(--row-site-color, var(--blue));
+}
+
+.alert-section {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.alert-section + .alert-section {
+  margin-top: 12px;
+}
+
+.alert-section-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-alt);
+}
+
+.alert-section-header strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-section-header span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.alert-people {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.alert-person {
+  grid-template-columns: 42px minmax(0, 1fr);
+  border-left-color: var(--warning);
 }
 
 .person-card footer {

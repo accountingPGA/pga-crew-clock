@@ -194,7 +194,7 @@
     </main>
 
     <div class="modal-backdrop" id="lunchDialog" hidden>
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="lunchTitle" aria-describedby="lunchText">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="lunchTitle">
         <div class="modal-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24">
             <path d="M4 11h16" />
@@ -204,16 +204,15 @@
           </svg>
         </div>
         <h2 id="lunchTitle">Did you take lunch?</h2>
-        <p id="lunchText">Payroll 2.0 decides whether lunch is deducted or paid from the jobsite area.</p>
         <div class="modal-actions">
-          <button class="secondary-button" id="lunchNoButton" type="button">No lunch</button>
+          <button class="secondary-button" id="lunchNoButton" type="button">No Lunch</button>
           <button class="primary-button" id="lunchYesButton" type="button">Yes</button>
         </div>
       </section>
     </div>
 
     <div class="modal-backdrop" id="switchDialog" hidden>
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="switchTitle" aria-describedby="switchText">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="switchTitle">
         <div class="modal-icon travel" aria-hidden="true">
           <svg viewBox="0 0 24 24">
             <path d="M5 17h14" />
@@ -223,18 +222,10 @@
             <circle cx="16" cy="17" r="2" />
           </svg>
         </div>
-        <h2 id="switchTitle">Switch jobsite</h2>
-        <p id="switchText">The current jobsite shift saves first, then a new jobsite row starts.</p>
+        <h2 id="switchTitle">Switch Jobsite</h2>
         <label class="modal-field">
-          New jobsite
+          Where are you starting?
           <select id="switchSiteSelect"></select>
-        </label>
-        <label class="modal-field">
-          Lunch on current jobsite
-          <select id="switchLunchSelect">
-            <option value="No">No</option>
-            <option value="Yes">Yes</option>
-          </select>
         </label>
         <div class="modal-actions">
           <button class="secondary-button" id="switchCancelButton" type="button">Cancel</button>
