@@ -1,802 +1,776 @@
-const STORAGE_KEY = "pinnacle-crew-clock-ui-v1";
-const APP_TIME_ZONE = "America/Vancouver";
-const CONFIG_API_URL = "https://script.google.com/macros/s/AKfycbxCra1iI6QIaMAt3JT3ZB1Wlkp24nkQRxUbUbORRJ5d53kVBqfb44KCNl17FIDqUPC9/exec";
+const CONFIG = {
+  apiUrl: window.CREW_CLOCK_CONFIG?.apiUrl || "",
+  vapidPublicKey: window.CREW_CLOCK_CONFIG?.vapidPublicKey || "",
+};
 
-let employees = [];
-let sites = [];
-let jobsiteMeta = {};
-let serverSubmissions = [];
-let submissions = [];
-let features = {};
-let state = loadUiState();
-let currentUser = null;
-let pinBuffer = "";
-let pendingLunchAction = null;
-let pendingLunchSubmissionId = null;
-let pendingSwitchLunch = null;
-let isProcessing = false;
-let toastTimer;
-let renderTimer;
-let configRefreshTimer;
-const expandedRouteEmployeeIds = new Set();
-const collapsedAlertGroupKeys = new Set();
-const MANAGER_ROLES = new Set(["manager", "admin", "foreman", "supervisor"]);
-const ALERT_GROUPS = [
-  { key: "notCheckedIn", label: "Not Checked In Yet" },
-  { key: "stillClockedIn", label: "Still Clocked In" },
-  { key: "lunchNotAnswered", label: "Lunch Not Answered" },
-  { key: "notListedJobsite", label: "Not Listed Jobsite" },
-  { key: "syncImportIssue", label: "Sync / Import Issue" }
-];
+const STORAGE_KEY = "pga-crew-clock-payroll-v2";
+const API_PLACEHOLDER = "PASTE_APPS_SCRIPT_WEB_APP_URL_HERE";
+const VAPID_PLACEHOLDER = "PASTE_WEB_PUSH_VAPID_PUBLIC_KEY_HERE";
+const APP_TIME_ZONE = "America/Vancouver";
+const LONG_SHIFT_WARNING_MS = 10 * 60 * 60 * 1000;
+const LONG_SHIFT_CRITICAL_MS = 12 * 60 * 60 * 1000;
 
 const els = {
   loginScreen: document.querySelector("#loginScreen"),
   appShell: document.querySelector("#appShell"),
-  pinDots: document.querySelectorAll("#pinDots span"),
-  pinButtons: document.querySelectorAll("[data-pin]"),
-  pinBackButton: document.querySelector("[data-pin-back]"),
-  pinClearButton: document.querySelector("[data-pin-clear]"),
-  loginError: document.querySelector("#loginError"),
-  currentUserLabel: document.querySelector("#currentUserLabel"),
+  pinDots: document.querySelectorAll(".pin-dots span"),
+  keypad: document.querySelector(".keypad"),
+  loginMessage: document.querySelector("#loginMessage"),
   logoutButton: document.querySelector("#logoutButton"),
+  workerName: document.querySelector("#workerName"),
+  workerRole: document.querySelector("#workerRole"),
+  connectionBar: document.querySelector("#connectionBar"),
+  connectionText: document.querySelector("#connectionText"),
+  managerTabs: document.querySelector("#managerTabs"),
+  tabs: document.querySelectorAll(".tab"),
+  views: document.querySelectorAll(".view"),
+  refreshButton: document.querySelector("#refreshButton"),
   siteSelect: document.querySelector("#siteSelect"),
+  siteSwatch: document.querySelector("#siteSwatch"),
   liveClock: document.querySelector("#liveClock"),
+  statusPanel: document.querySelector("#statusPanel"),
   statusPill: document.querySelector("#statusPill"),
   clockTitle: document.querySelector("#clockTitle"),
   statusDetail: document.querySelector("#statusDetail"),
-  syncMessage: document.querySelector("#syncMessage"),
   primaryActions: document.querySelector("#primaryActions"),
   clockButton: document.querySelector("#clockButton"),
   switchButton: document.querySelector("#switchButton"),
+  absentButton: document.querySelector("#absentButton"),
+  reminderPanel: document.querySelector("#reminderPanel"),
+  enableRemindersButton: document.querySelector("#enableRemindersButton"),
+  remindersStatus: document.querySelector("#remindersStatus"),
   syncStatus: document.querySelector("#syncStatus"),
-  lunchSummary: document.querySelector("#lunchSummary"),
-  todayRecordCount: document.querySelector("#todayRecordCount"),
+  lunchStatus: document.querySelector("#lunchStatus"),
+  rowCount: document.querySelector("#rowCount"),
   timelineList: document.querySelector("#timelineList"),
   entryCount: document.querySelector("#entryCount"),
-  tabs: document.querySelectorAll(".tab"),
-  views: document.querySelectorAll(".view"),
-  managerOnly: document.querySelectorAll(".manager-only"),
-  alertsTab: document.querySelector("#alertsTab"),
-  alertsTabLabel: document.querySelector("#alertsTabLabel"),
-  liveJobsiteList: document.querySelector("#liveJobsiteList"),
-  checkedInTodayCount: document.querySelector("#checkedInTodayCount"),
-  attentionList: document.querySelector("#attentionList"),
-  issueCount: document.querySelector("#issueCount"),
-  exportButton: document.querySelector("#exportButton"),
+  clockedInCount: document.querySelector("#clockedInCount"),
+  clockedOutCount: document.querySelector("#clockedOutCount"),
+  teamHours: document.querySelector("#teamHours"),
+  activeJobsiteCount: document.querySelector("#activeJobsiteCount"),
+  teamList: document.querySelector("#teamList"),
+  alertsList: document.querySelector("#alertsList"),
+  retryButton: document.querySelector("#retryButton"),
   lunchDialog: document.querySelector("#lunchDialog"),
   lunchYesButton: document.querySelector("#lunchYesButton"),
   lunchNoButton: document.querySelector("#lunchNoButton"),
   switchDialog: document.querySelector("#switchDialog"),
   switchSiteSelect: document.querySelector("#switchSiteSelect"),
+  switchLunchSelect: document.querySelector("#switchLunchSelect"),
   switchConfirmButton: document.querySelector("#switchConfirmButton"),
   switchCancelButton: document.querySelector("#switchCancelButton"),
-  toast: document.querySelector("#toast")
+  absentDialog: document.querySelector("#absentDialog"),
+  absentYesButton: document.querySelector("#absentYesButton"),
+  absentNoButton: document.querySelector("#absentNoButton"),
+  toast: document.querySelector("#toast"),
 };
 
-function todayKey(date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: APP_TIME_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(date);
-  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return `${lookup.year}-${lookup.month}-${lookup.day}`;
-}
+let payroll = {
+  employees: [],
+  jobsites: [],
+  absences: [],
+  clockStates: [],
+  loadedAt: null,
+};
 
-function loadUiState() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    return {
-      selectedSite: saved.selectedSite || "",
-      localSubmissions: normalizeLocalSubmissions(saved.localSubmissions || [])
-    };
-  } catch {
-    localStorage.removeItem(STORAGE_KEY);
-    return { selectedSite: "", localSubmissions: [] };
-  }
-}
+let state = loadState();
+let pinBuffer = "";
+let pendingClockOutShiftId = null;
+let toastTimer;
+let renderTimer;
+let serviceWorkerRegistration = null;
 
-function saveUiState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({
-    selectedSite: state.selectedSite || "",
-    localSubmissions: pruneLocalSubmissions(state.localSubmissions || [])
-  }));
-}
-
-function setup() {
-  els.pinButtons.forEach((button) => button.addEventListener("click", () => addPinDigit(button.dataset.pin)));
-  els.pinBackButton.addEventListener("click", removePinDigit);
-  els.pinClearButton.addEventListener("click", clearPin);
-  els.logoutButton.addEventListener("click", logout);
-  els.siteSelect.addEventListener("change", () => {
-    state.selectedSite = els.siteSelect.value;
-    saveUiState();
-    render();
-  });
-
-  els.clockButton.addEventListener("click", toggleClock);
-  els.switchButton.addEventListener("click", beginSwitchJobsite);
-  els.lunchYesButton.addEventListener("click", () => handleLunchAnswer(true));
-  els.lunchNoButton.addEventListener("click", () => handleLunchAnswer(false));
-  els.switchConfirmButton.addEventListener("click", confirmSwitchJobsite);
-  els.switchCancelButton.addEventListener("click", closeSwitchDialog);
-  els.exportButton.addEventListener("click", openConfiguredExport);
-
-  els.tabs.forEach((tab) => {
-    tab.addEventListener("click", () => {
-      if (tab.classList.contains("manager-only") && !isManager()) return;
-      showView(tab.dataset.tab);
-    });
-  });
-
-  renderSelect(els.siteSelect, sites, state.selectedSite);
-  showLogin();
-
-  window.clearInterval(renderTimer);
-  renderTimer = window.setInterval(() => {
-    renderClockOnly();
-    if (currentUser) render();
-  }, 1000);
-
-  window.clearInterval(configRefreshTimer);
-  configRefreshTimer = window.setInterval(refreshConfigFromBackend, 30000);
-}
-
-async function loadConfig() {
-  const data = await apiGet("config");
-  normalizeConfig(data);
-  if (!employees.length) throw new Error("No active employees returned from App Employees");
-  if (!sites.length) throw new Error("No active jobsites returned from Lists");
-  state.selectedSite = sites.includes(state.selectedSite) ? state.selectedSite : sites[0];
-  saveUiState();
-}
-
-async function refreshConfigFromBackend() {
-  if (!currentUser || isProcessing) return;
-  try {
-    await loadConfig();
-    renderSelect(els.siteSelect, sites, state.selectedSite);
-    render();
-  } catch (error) {
-    console.warn("Crew Clock refresh failed", error);
-  }
-}
-
-function normalizeConfig(data) {
-  const loadedEmployees = Array.isArray(data?.employees) ? data.employees : [];
-  const loadedJobsites = Array.isArray(data?.jobsites) ? data.jobsites : [];
-  const loadedSubmissions = Array.isArray(data?.submissions) ? data.submissions : [];
-  const loadedOpenShifts = Array.isArray(data?.openShifts) ? data.openShifts : [];
-
-  employees = loadedEmployees
-    .map((employee) => ({
-      id: String(employee.id || employee.employeeId || "").trim(),
-      name: String(employee.name || employee.employeeName || "").trim(),
-      initials: String(employee.initials || initialsFor(employee.name || employee.employeeName)).trim(),
-      pin: String(employee.pin || "").trim(),
-      role: String(employee.role || "employee").trim().toLowerCase()
-    }))
-    .filter((employee) => employee.id && employee.name && employee.pin)
-    .map((employee) => ({
-      ...employee,
-      role: MANAGER_ROLES.has(employee.role) ? employee.role : "employee"
-    }));
-
-  const normalizedJobsites = loadedJobsites
-    .map((site) => {
-      if (typeof site === "string") return { name: site.trim(), color: "#6B7280", status: "Active" };
-      return {
-        name: String(site.name || site.jobsite || site.site || "").trim(),
-        area: String(site.area || "").trim(),
-        color: String(site.color || "#6B7280").trim(),
-        status: String(site.status || "Active").trim()
-      };
-    })
-    .filter((site) => site.name);
-
-  sites = normalizedJobsites.map((site) => site.name);
-  jobsiteMeta = normalizedJobsites.reduce((map, site) => {
-    map[site.name] = site;
-    return map;
-  }, {});
-
-  serverSubmissions = loadedSubmissions
-    .concat(loadedOpenShifts)
-    .map(normalizeSubmission)
-    .filter((row) => row.submissionId);
-  mergeSubmissions();
-  features = data?.features || {};
-}
-
-function normalizeSubmission(row) {
-  const worker = String(row.worker || "").trim();
+function defaultState() {
   return {
-    submissionId: String(row.submissionId || row.id || "").trim(),
-    openShiftId: String(row.openShiftId || row.openId || "").trim(),
-    submittedAt: String(row.submittedAt || "").trim(),
-    employeeId: String(row.employeeId || row.workerId || safeWorkerId(worker) || "").trim(),
-    employeeName: String(row.employeeName || row.name || worker || "").trim(),
-    date: String(row.date || "").trim(),
-    jobsite: String(row.jobsite || "").trim(),
-    startTime: String(row.startTime || "").trim(),
-    endTime: String(row.endTime || "").trim(),
-    lunch: normalizeLunch(row.lunch),
-    imported: String(row.imported || row.importStatus || "").trim(),
-    importedAt: String(row.importedAt || "").trim(),
-    rowNumber: Number(row.rowNumber || 0),
-    localOnly: Boolean(row.localOnly),
-    openOnly: Boolean(row.openOnly || row.isOpen),
-    syncStatus: String(row.syncStatus || "").trim(),
-    error: String(row.error || "").trim(),
-    startIso: String(row.startIso || row.startTime || "").trim(),
-    endIso: String(row.endIso || row.endTime || "").trim(),
-    serverSubmissionId: String(row.serverSubmissionId || "").trim()
+    day: todayKey(),
+    auth: null,
+    selectedJobsite: "",
+    activeShifts: {},
+    shifts: [],
+    absenceDate: "",
+    notificationEndpoint: "",
+    reminderStatus: "",
+    activeTab: "clock",
+    lastSync: "Ready",
   };
 }
 
-function normalizeLocalSubmissions(rows) {
-  if (!Array.isArray(rows)) return [];
-  return pruneLocalSubmissions(rows.map(normalizeSubmission).filter((row) => row.submissionId));
+function loadState() {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (!saved) return defaultState();
+  try {
+    const parsed = JSON.parse(saved);
+    if (parsed.day === todayKey()) {
+      return { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {} };
+    }
+  } catch {
+    localStorage.removeItem(STORAGE_KEY);
+  }
+  return defaultState();
 }
 
-function pruneLocalSubmissions(rows) {
-  const today = todayKey();
-  return rows.filter((row) => row.date === today || !row.endTime);
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
-function mergeSubmissions() {
-  state.localSubmissions = pruneLocalSubmissions(state.localSubmissions || []);
-  const serverIds = new Set(serverSubmissions.map((row) => row.submissionId).filter(Boolean));
-  const localOnlyRows = state.localSubmissions.filter((row) => (
-    !serverIds.has(row.submissionId) &&
-    !serverIds.has(row.serverSubmissionId)
-  ));
-  submissions = [...serverSubmissions, ...localOnlyRows];
-}
-
-function updateLocalSubmissions(updater) {
-  state.localSubmissions = pruneLocalSubmissions(updater(state.localSubmissions || []));
-  mergeSubmissions();
-  saveUiState();
-}
-
-function normalizeLunch(value) {
-  const text = String(value ?? "").trim().toLowerCase();
-  if (text === "yes" || text === "true" || text === "30m" || text === "30 min") return "Yes";
-  if (text === "no" || text === "false" || text === "none") return "No";
-  return "";
+function apiReady() {
+  return CONFIG.apiUrl && CONFIG.apiUrl !== API_PLACEHOLDER;
 }
 
 async function apiGet(action) {
-  const response = await fetch(`${CONFIG_API_URL}?action=${encodeURIComponent(action)}`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`API request failed: ${response.status}`);
-  const data = await response.json();
-  if (data.success === false || data.ok === false) throw new Error(data.message || data.error || "API request failed");
-  return data;
+  if (!apiReady()) throw new Error("Add the Apps Script Web App URL in index.html.");
+  const url = new URL(CONFIG.apiUrl);
+  url.searchParams.set("action", action);
+  url.searchParams.set("_", Date.now().toString());
+  const response = await fetch(url.toString(), { method: "GET" });
+  return parseApiResponse(response);
 }
 
-async function apiPost(action, payload) {
-  const response = await fetch(CONFIG_API_URL, {
+async function apiPost(action, payload = {}) {
+  if (!apiReady()) throw new Error("Add the Apps Script Web App URL in index.html.");
+  const response = await fetch(CONFIG.apiUrl, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action, ...payload })
+    body: JSON.stringify({ action, ...payload }),
   });
+  return parseApiResponse(response);
+}
 
-  if (!response.ok) throw new Error(`API request failed: ${response.status}`);
-  const data = await response.json();
-  if (data.success === false || data.ok === false) throw new Error(data.message || data.error || "API request failed");
-  if (hasConfigPayload(data)) normalizeConfig(data);
+async function parseApiResponse(response) {
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("Payroll 2.0 returned an unreadable response.");
+  }
+  if (data.ok === false) throw new Error(data.error || "Payroll 2.0 request failed.");
   return data;
 }
 
-function hasConfigPayload(data) {
-  return Array.isArray(data?.employees) ||
-    Array.isArray(data?.jobsites) ||
-    Array.isArray(data?.submissions) ||
-    Array.isArray(data?.openShifts);
-}
+function setup() {
+  els.keypad.addEventListener("click", (event) => {
+    const key = event.target.closest("button")?.dataset.key;
+    if (key) handlePinKey(key);
+  });
+  window.addEventListener("keydown", handleKeyboardPin);
+  els.logoutButton.addEventListener("click", logout);
+  els.refreshButton.addEventListener("click", loadBootstrap);
+  els.siteSelect.addEventListener("change", () => {
+    state.selectedJobsite = els.siteSelect.value;
+    saveState();
+    render();
+  });
+  els.clockButton.addEventListener("click", toggleClock);
+  els.switchButton.addEventListener("click", openSwitchDialog);
+  els.absentButton.addEventListener("click", handleAbsentButton);
+  els.enableRemindersButton.addEventListener("click", enableClockReminders);
+  els.retryButton.addEventListener("click", retryFailedSaves);
+  els.lunchYesButton.addEventListener("click", () => finishClockOut("Yes"));
+  els.lunchNoButton.addEventListener("click", () => finishClockOut("No"));
+  els.switchConfirmButton.addEventListener("click", switchJobsite);
+  els.switchCancelButton.addEventListener("click", closeSwitchDialog);
+  els.absentYesButton.addEventListener("click", markAbsentToday);
+  els.absentNoButton.addEventListener("click", closeAbsentDialog);
 
-function renderSelect(select, options, selectedValue) {
-  select.innerHTML = options.map((option) => `<option value="${escapeHtml(option)}">${escapeHtml(option)}</option>`).join("");
-  select.value = selectedValue && options.includes(selectedValue) ? selectedValue : options[0] || "";
-}
+  els.tabs.forEach((tab) => {
+    tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
+  });
 
-function initialsFor(name) {
-  return String(name || "")
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("") || "??";
-}
-
-function safeWorkerId(worker) {
-  return String(worker || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function addPinDigit(value) {
-  if (pinBuffer.length >= 4) return;
-  pinBuffer += value;
-  renderPin();
-  if (pinBuffer.length === 4) window.setTimeout(authenticatePin, 160);
-}
-
-function removePinDigit() {
-  pinBuffer = pinBuffer.slice(0, -1);
-  renderPin();
-}
-
-function clearPin() {
-  pinBuffer = "";
-  els.loginError.textContent = "";
-  renderPin();
-}
-
-function renderPin() {
-  els.pinDots.forEach((dot, index) => dot.classList.toggle("filled", index < pinBuffer.length));
-}
-
-function authenticatePin() {
-  const employee = employees.find((item) => item.pin === pinBuffer);
-  if (!employee) {
-    els.loginError.textContent = "Incorrect PIN. Please try again.";
-    pinBuffer = "";
-    renderPin();
-    return;
+  registerServiceWorker();
+  renderTimer = window.setInterval(render, 1000);
+  if (state.auth) {
+    showApp();
+    loadBootstrap();
+  } else {
+    showLogin("");
   }
-
-  currentUser = employee;
-  pinBuffer = "";
-  renderPin();
-  els.loginError.textContent = "";
-  showApp();
-  showToast(`Welcome, ${employee.name}`);
+  render();
 }
 
-function showLogin() {
-  currentUser = null;
-  els.loginScreen.classList.remove("app-hidden");
-  els.appShell.classList.add("app-hidden");
-  pinBuffer = "";
-  renderPin();
+function handleKeyboardPin(event) {
+  if (state.auth) return;
+  if (/^\d$/.test(event.key)) {
+    event.preventDefault();
+    handlePinKey(event.key);
+  } else if (event.key === "Backspace") {
+    event.preventDefault();
+    handlePinKey("back");
+  } else if (event.key === "Escape") {
+    handlePinKey("clear");
+  }
+}
+
+function handlePinKey(key) {
+  if (key === "clear") {
+    pinBuffer = "";
+  } else if (key === "back") {
+    pinBuffer = pinBuffer.slice(0, -1);
+  } else if (/^\d$/.test(key) && pinBuffer.length < 4) {
+    pinBuffer += key;
+  }
+  renderPinDots();
+  if (pinBuffer.length === 4) loginWithPin();
+}
+
+function renderPinDots() {
+  els.pinDots.forEach((dot, index) => {
+    dot.classList.toggle("filled", index < pinBuffer.length);
+  });
+}
+
+async function loginWithPin() {
+  setLoginMessage("Checking PIN...");
+  try {
+    const data = await apiPost("login", { pin: pinBuffer });
+    state.auth = {
+      token: data.token,
+      worker: data.employee.worker,
+      role: data.employee.role || "Employee",
+      attendanceRequired: data.employee.attendanceRequired || "No",
+      expiresAt: data.expiresAt,
+      signedInAt: new Date().toISOString(),
+    };
+    state.lastSync = "Signed in";
+    state.activeTab = "clock";
+    pinBuffer = "";
+    saveState();
+    renderPinDots();
+    showApp();
+    await loadBootstrap();
+    showToast(`Signed in as ${state.auth.worker}`);
+  } catch (error) {
+    const message = error.message === "DUPLICATE_PIN"
+      ? "Duplicate PIN detected. Please contact the office."
+      : error.message || "PIN not accepted";
+    pinBuffer = "";
+    renderPinDots();
+    setLoginMessage(message, true);
+  }
+}
+
+async function loadBootstrap() {
+  setConnection("loading", "Refreshing Payroll 2.0");
+  try {
+    const data = await apiGet("bootstrap");
+    payroll = {
+      employees: data.employees || [],
+      jobsites: data.jobsites || [],
+      absences: data.absences || [],
+      clockStates: data.clockStates || [],
+      loadedAt: new Date().toISOString(),
+    };
+    const employee = currentEmployee();
+    if (employee && state.auth) {
+      state.auth.attendanceRequired = employee.attendanceRequired || state.auth.attendanceRequired || "No";
+    }
+    if (!payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
+      state.selectedJobsite = payroll.jobsites[0]?.jobsite || "";
+    }
+    state.lastSync = "Ready";
+    saveState();
+    setConnection("ready", "Connected to Payroll 2.0");
+  } catch (error) {
+    state.lastSync = "Connection failed";
+    setConnection("error", error.message);
+  } finally {
+    render();
+  }
+}
+
+function showLogin(message) {
+  els.loginScreen.hidden = false;
+  els.appShell.hidden = true;
+  setLoginMessage(message || "");
+  renderPinDots();
 }
 
 function showApp() {
-  els.loginScreen.classList.add("app-hidden");
-  els.appShell.classList.remove("app-hidden");
-  applyPermissions();
-  showView(isManager() ? "summary" : "clock");
-  render();
-  refreshConfigFromBackend();
+  els.loginScreen.hidden = true;
+  els.appShell.hidden = false;
 }
 
 function logout() {
-  if (!currentUser) return;
-  if (!window.confirm("Log out? You will need to enter your PIN again.")) return;
-  showLogin();
+  state.auth = null;
+  state.activeTab = "clock";
+  saveState();
+  showLogin("");
 }
 
-function isManager() {
-  return MANAGER_ROLES.has(String(currentUser?.role || "").toLowerCase());
-}
-
-function applyPermissions() {
-  const manager = isManager();
-  document.body.classList.toggle("employee-mode", !manager);
-
-  els.managerOnly.forEach((element) => {
-    element.hidden = !manager;
-    element.classList.toggle("app-hidden", !manager);
-  });
-
-  const hasExport = Boolean(features.exportUrl || features.export === true);
-  els.exportButton.hidden = !manager || !hasExport;
-
-  if (!manager) showView("clock");
-  if (currentUser) {
-    els.currentUserLabel.textContent = `${currentUser.name}${manager ? " (Manager)" : ""}`;
-  }
-}
-
-function showView(target) {
-  els.tabs.forEach((item) => item.classList.toggle("active", item.dataset.tab === target));
-  els.views.forEach((view) => view.classList.toggle("active", view.id === `${target}View`));
-}
-
-function selectedEmployee() {
-  return currentUser;
-}
-
-function todaySubmissions() {
-  const today = todayKey();
-  return submissions.filter((row) => row.date === today || !row.endTime);
-}
-
-function submissionsFor(employeeId) {
-  return todaySubmissions().filter((row) => row.employeeId === employeeId);
-}
-
-function activeSubmission(employeeId) {
-  return submissions.find((row) => row.employeeId === employeeId && !row.endTime);
-}
-
-async function toggleClock() {
-  if (!currentUser) return showLogin();
-  const current = activeSubmission(currentUser.id);
-
-  if (current) {
-    openLunchDialog("clockOut", current.submissionId);
-    return;
-  }
-
-  await clockIn();
-}
-
-async function clockIn() {
-  const existingOpen = activeSubmission(currentUser.id);
-  if (existingOpen) return showError("You are already clocked in.");
-
-  const jobsite = els.siteSelect.value || state.selectedSite;
-  if (!jobsite) return showError("Please select a jobsite.");
-
-  setProcessing(true);
-  setSyncMessage("Clocking in...", false);
-  try {
-    const token = await ensureSessionToken();
-    await apiPost("clockIn", { token, jobsite });
-    state.selectedSite = jobsite;
-    saveUiState();
-    setSyncMessage("Clocked in and synced", false);
-    showToast("Clocked in and synced");
-    render();
-  } catch (error) {
-    console.error(error);
-    if (isBackendOpenShiftMissing(error)) {
-      createLocalClockInFallback(jobsite);
-    } else {
-      showError(error.message ? `Clock In failed. ${error.message}` : "Clock In failed. Please try again.");
-    }
-  } finally {
-    setProcessing(false);
-  }
-}
-
-function createLocalClockInFallback(jobsite) {
-  const startedAt = new Date();
-  const row = localClockRow(jobsite, startedAt);
-  updateLocalSubmissions((rows) => [row, ...rows.filter((item) => item.employeeId !== currentUser.id || item.endTime)]);
-  state.selectedSite = jobsite;
-  saveUiState();
-  setSyncMessage("Backend open-shift update needed. Clocked in on this device only.", true);
-  showToast("Clocked in on this device");
+function setActiveTab(tab) {
+  state.activeTab = tab;
+  saveState();
   render();
 }
 
-function isBackendOpenShiftMissing(error) {
-  return /unknown action/i.test(String(error?.message || ""));
+function currentWorker() {
+  return state.auth?.worker || "";
 }
 
-function openShiftIdentifier(row) {
-  return row.openShiftId || row.submissionId;
+function currentRole() {
+  return state.auth?.role || "Employee";
 }
 
-function localClockRow(jobsite, startedAt) {
-  const startIso = startedAt.toISOString();
-  return {
-    submissionId: `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    submittedAt: startIso,
-    employeeId: currentUser.id,
-    employeeName: currentUser.name,
-    date: todayKey(startedAt),
-    jobsite,
-    startTime: startIso,
-    endTime: "",
-    lunch: "",
-    imported: "Local",
-    importedAt: "",
-    rowNumber: Date.now(),
-    localOnly: true,
-    syncStatus: "open",
-    error: "",
-    startIso,
-    endIso: "",
-    serverSubmissionId: ""
+function currentEmployee() {
+  return payroll.employees.find((employee) => employee.worker === currentWorker()) || null;
+}
+
+function attendanceRequiredFor(worker = currentWorker()) {
+  const employee = payroll.employees.find((item) => item.worker === worker);
+  const value = employee?.attendanceRequired || (worker === currentWorker() ? state.auth?.attendanceRequired : "");
+  return String(value || "").toLowerCase() === "yes";
+}
+
+function isManagerMode() {
+  const role = currentRole().toLowerCase();
+  return ["admin", "manager", "supervisor", "foreman", "lead", "operations", "office"].some((word) => role.includes(word));
+}
+
+function currentActiveShift() {
+  return state.activeShifts[currentWorker()] || null;
+}
+
+function completedRowsFor(worker = currentWorker()) {
+  return state.shifts.filter((shift) => shift.worker === worker && localDateKey(new Date(shift.start)) === todayKey());
+}
+
+function activeShiftFor(worker) {
+  return state.activeShifts[worker] || null;
+}
+
+function hasClockedInToday(worker = currentWorker()) {
+  const status = clockStateFor(worker)?.status;
+  return !!activeShiftFor(worker) || completedRowsFor(worker).length > 0 || status === "Clocked In" || status === "Clocked Out";
+}
+
+function clockStateFor(worker = currentWorker()) {
+  return payroll.clockStates.find((entry) => entry.worker === worker && entry.date === todayKey()) || null;
+}
+
+function isAbsentToday(worker = currentWorker()) {
+  if (worker === currentWorker() && state.absenceDate === todayKey()) return true;
+  return payroll.absences.some((entry) => entry.worker === worker && entry.date === todayKey() && entry.status === "Absent");
+}
+
+function setLocalAbsence(isAbsent) {
+  state.absenceDate = isAbsent ? todayKey() : "";
+  payroll.absences = payroll.absences.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
+  if (isAbsent) {
+    payroll.absences.push({ worker: currentWorker(), date: todayKey(), status: "Absent" });
+  }
+}
+
+async function toggleClock() {
+  if (!state.auth) return;
+  if (!payroll.jobsites.length) return showToast("No active jobsites in Payroll 2.0");
+  if (isAbsentToday()) return showToast("Undo absence before clocking in");
+  const current = currentActiveShift();
+  if (current) {
+    pendingClockOutShiftId = current.id;
+    els.lunchDialog.hidden = false;
+    els.lunchNoButton.focus();
+    return;
+  }
+
+  state.activeShifts[currentWorker()] = {
+    id: newId(),
+    worker: currentWorker(),
+    jobsite: state.selectedJobsite || payroll.jobsites[0].jobsite,
+    start: new Date().toISOString(),
   };
+  saveState();
+  render();
+  recordClockState("Clocked In", state.activeShifts[currentWorker()]);
+  showToast("Clocked in");
 }
 
-function beginSwitchJobsite() {
-  const current = activeSubmission(currentUser?.id);
-  if (!current) return showError("No open row found. Please refresh and try again.");
-  openLunchDialog("switch", current.submissionId);
-}
-
-function openLunchDialog(action, submissionId) {
-  pendingLunchAction = action;
-  pendingLunchSubmissionId = submissionId;
-  els.lunchDialog.hidden = false;
-  els.lunchYesButton.focus();
-}
-
-async function handleLunchAnswer(tookLunch) {
-  const action = pendingLunchAction;
-  const submissionId = pendingLunchSubmissionId;
-  if (!action || !submissionId) {
+async function finishClockOut(lunch) {
+  const current = currentActiveShift();
+  if (!current || current.id !== pendingClockOutShiftId) {
     closeLunchDialog();
     return;
   }
 
-  if (action === "switch") {
-    pendingSwitchLunch = tookLunch ? "Yes" : "No";
-    closeLunchDialog();
-    openSwitchDialog();
-    return;
-  }
-
-  await clockOut(submissionId, tookLunch ? "Yes" : "No");
-}
-
-async function clockOut(submissionId, lunch) {
-  const current = activeSubmission(currentUser.id);
-  if (!current) {
-    closeLunchDialog();
-    return showError("No open row found. You are already clocked out.");
-  }
-
-  if (current.localOnly) {
-    closeLunchDialog();
-    await completeLocalShift(current, lunch);
-    return;
-  }
-
-  await runSyncedAction(async () => {
-    const token = await ensureSessionToken();
-    await apiPost("clockOut", {
-      token,
-      employeeId: currentUser.id,
-      submissionId,
-      openShiftId: openShiftIdentifier(current),
-      lunch
-    });
-    closeLunchDialog();
-    showToast("Clocked out and synced");
-  });
+  closeLunchDialog();
+  const completed = {
+    ...current,
+    end: new Date().toISOString(),
+    lunch,
+    syncStatus: "pending",
+  };
+  delete state.activeShifts[currentWorker()];
+  state.shifts.unshift(completed);
+  state.lastSync = "Saving";
+  saveState();
+  render();
+  recordClockState("Clocked Out", completed);
+  await saveCompletedShift(completed);
 }
 
 function closeLunchDialog() {
+  pendingClockOutShiftId = null;
   els.lunchDialog.hidden = true;
-  pendingLunchAction = null;
-  pendingLunchSubmissionId = null;
 }
 
 function openSwitchDialog() {
-  const current = activeSubmission(currentUser?.id);
-  if (!current) return showError("No open row found. Please refresh and try again.");
-  const nextSite = sites.find((site) => site !== current.jobsite) || sites[0];
-  renderSelect(els.switchSiteSelect, sites, nextSite);
+  const current = currentActiveShift();
+  if (!current) return;
+  const next = payroll.jobsites.find((jobsite) => jobsite.jobsite !== current.jobsite) || payroll.jobsites[0];
+  renderJobsiteSelect(els.switchSiteSelect, next?.jobsite || "");
+  els.switchLunchSelect.value = "No";
   els.switchDialog.hidden = false;
   els.switchSiteSelect.focus();
 }
 
 function closeSwitchDialog() {
   els.switchDialog.hidden = true;
-  pendingSwitchLunch = null;
 }
 
-async function confirmSwitchJobsite() {
-  const current = activeSubmission(currentUser?.id);
+function handleAbsentButton() {
+  if (isAbsentToday()) {
+    undoAbsenceToday();
+    return;
+  }
+  els.absentDialog.hidden = false;
+  els.absentNoButton.focus();
+}
+
+function closeAbsentDialog() {
+  els.absentDialog.hidden = true;
+}
+
+async function markAbsentToday() {
+  closeAbsentDialog();
+  if (hasClockedInToday()) return showToast("You already clocked in today");
+  setLocalAbsence(true);
+  saveState();
+  render();
+  setConnection("loading", "Saving absence");
+  try {
+    await apiPost("markAbsent", {
+      token: state.auth?.token,
+      date: todayKey(),
+    });
+    await recordClockState("Absent", {});
+    setConnection("ready", "Absent Today saved");
+    showToast("Absent Today saved");
+  } catch (error) {
+    setLocalAbsence(false);
+    saveState();
+    setConnection("error", error.message);
+    showToast("Could not save absence");
+  } finally {
+    render();
+  }
+}
+
+async function undoAbsenceToday() {
+  setLocalAbsence(false);
+  saveState();
+  render();
+  setConnection("loading", "Undoing absence");
+  try {
+    await apiPost("undoAbsence", {
+      token: state.auth?.token,
+      date: todayKey(),
+    });
+    await recordClockState("Not Clocked In", {});
+    setConnection("ready", "Absence removed");
+    showToast("Absence removed");
+  } catch (error) {
+    setLocalAbsence(true);
+    saveState();
+    setConnection("error", error.message);
+    showToast("Could not undo absence");
+  } finally {
+    render();
+  }
+}
+
+async function switchJobsite() {
+  const current = currentActiveShift();
   const nextJobsite = els.switchSiteSelect.value;
+  if (!current) return closeSwitchDialog();
+  if (!nextJobsite || nextJobsite === current.jobsite) return showToast("Select a different jobsite");
 
-  if (!current) return showError("No open row found. Please refresh and try again.");
-  if (!pendingSwitchLunch) return showError("Please answer the lunch question first.");
-  if (!nextJobsite) return showError("Please select the new jobsite.");
-  if (nextJobsite === current.jobsite) return showError("Select a different jobsite.");
+  const now = new Date().toISOString();
+  const completed = {
+    ...current,
+    end: now,
+    lunch: els.switchLunchSelect.value === "Yes" ? "Yes" : "No",
+    travelTo: nextJobsite,
+    syncStatus: "pending",
+  };
 
-  if (current.localOnly) {
-    closeSwitchDialog();
-    await completeLocalShift(current, pendingSwitchLunch, nextJobsite);
+  state.activeShifts[currentWorker()] = {
+    id: newId(),
+    worker: currentWorker(),
+    jobsite: nextJobsite,
+    start: now,
+    travelFrom: current.jobsite,
+  };
+  state.selectedJobsite = nextJobsite;
+  state.shifts.unshift(completed);
+  state.lastSync = "Saving";
+  closeSwitchDialog();
+  saveState();
+  render();
+  recordClockState("Clocked In", state.activeShifts[currentWorker()]);
+  await saveCompletedShift(completed);
+  showToast("New jobsite started");
+}
+
+async function recordClockState(status, shift = {}) {
+  if (!state.auth || !apiReady()) return;
+  try {
+    const payload = {
+      token: state.auth.token,
+      status,
+      date: todayKey(),
+      jobsite: shift.jobsite || "",
+      clockInAt: shift.start || "",
+      clockOutAt: shift.end || "",
+    };
+    const data = await apiPost("clockState", payload);
+    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
+    payroll.clockStates.push(data.clockState || { worker: currentWorker(), date: todayKey(), status });
+  } catch {
+    // Payroll saving stays independent from reminder state updates.
+  }
+}
+
+async function saveCompletedShift(shift) {
+  updateShiftSync(shift.id, { syncStatus: "pending", error: "" });
+  setConnection("loading", "Saving to Payroll 2.0");
+  try {
+    const data = await apiPost("saveShift", {
+      token: state.auth?.token,
+      shift: toSubmissionPayload(shift),
+    });
+    updateShiftSync(shift.id, {
+      syncStatus: "saved",
+      submissionId: data.submissionId,
+      error: "",
+    });
+    state.lastSync = "Saved to Payroll 2.0";
+    saveState();
+    setConnection("ready", "Saved to Payroll 2.0");
+  } catch (error) {
+    updateShiftSync(shift.id, { syncStatus: "failed", error: error.message });
+    state.lastSync = "Save failed, try again";
+    saveState();
+    setConnection("error", "Save failed, try again");
+  } finally {
+    render();
+  }
+}
+
+function updateShiftSync(id, patch) {
+  state.shifts = state.shifts.map((shift) => (shift.id === id ? { ...shift, ...patch } : shift));
+  saveState();
+}
+
+async function retryFailedSaves() {
+  const failed = state.shifts.filter((shift) => shift.syncStatus === "failed");
+  if (!failed.length) return showToast("No failed saves");
+  for (const shift of failed) {
+    await saveCompletedShift(shift);
+  }
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    serviceWorkerRegistration = await navigator.serviceWorker.register("./service-worker.js");
+  } catch {
+    serviceWorkerRegistration = null;
+  }
+}
+
+async function enableClockReminders() {
+  if (!attendanceRequiredFor()) {
+    state.reminderStatus = "Reminders are off for this worker.";
+    saveState();
+    render();
+    return;
+  }
+  if (!("Notification" in window) || !("PushManager" in window) || !("serviceWorker" in navigator)) {
+    state.reminderStatus = "Clock reminders are not supported on this browser.";
+    saveState();
+    render();
+    return;
+  }
+  if (!CONFIG.vapidPublicKey || CONFIG.vapidPublicKey === VAPID_PLACEHOLDER) {
+    state.reminderStatus = "Reminder setup needs the web push public key.";
+    saveState();
+    render();
     return;
   }
 
-  await runSyncedAction(async () => {
-    const token = await ensureSessionToken();
-    await apiPost("switchJobsite", {
-      token,
-      employeeId: currentUser.id,
-      submissionId: current.submissionId,
-      openShiftId: openShiftIdentifier(current),
-      lunch: pendingSwitchLunch,
-      newJobsite: nextJobsite
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    state.reminderStatus = "Clock reminders were not enabled.";
+    saveState();
+    render();
+    return;
+  }
+
+  try {
+    const registration = serviceWorkerRegistration || await navigator.serviceWorker.register("./service-worker.js");
+    const existing = await registration.pushManager.getSubscription();
+    const subscription = existing || await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(CONFIG.vapidPublicKey),
     });
-    state.selectedSite = nextJobsite;
-    saveUiState();
-    closeSwitchDialog();
-    showToast("Jobsite switched and synced");
-  });
+
+    await apiPost("registerPushSubscription", {
+      token: state.auth?.token,
+      subscription: subscription.toJSON(),
+      userAgent: navigator.userAgent,
+    });
+
+    state.notificationEndpoint = subscription.endpoint;
+    state.reminderStatus = "Clock reminders enabled on this device.";
+    saveState();
+    render();
+    showToast("Clock reminders enabled");
+  } catch (error) {
+    state.reminderStatus = error.message || "Could not enable reminders.";
+    saveState();
+    render();
+  }
 }
 
-async function completeLocalShift(current, lunch, nextJobsite = "") {
-  const endedAt = new Date();
-  const completed = {
-    ...current,
-    endTime: endedAt.toISOString(),
-    lunch,
-    syncStatus: "pending",
-    error: "",
-    endIso: endedAt.toISOString()
+function toSubmissionPayload(shift) {
+  return {
+    clientShiftId: shift.id,
+    worker: shift.worker,
+    date: localDateKey(new Date(shift.start)),
+    jobsite: shift.jobsite,
+    startIso: shift.start,
+    endIso: shift.end,
+    lunch: shift.lunch === "Yes" ? "Yes" : "No",
+    notes: "",
   };
-  const nextOpen = nextJobsite ? localClockRow(nextJobsite, endedAt) : null;
-
-  updateLocalSubmissions((rows) => {
-    const withoutCurrent = rows.filter((row) => row.submissionId !== current.submissionId);
-    return nextOpen ? [nextOpen, completed, ...withoutCurrent] : [completed, ...withoutCurrent];
-  });
-  if (nextJobsite) {
-    state.selectedSite = nextJobsite;
-    saveUiState();
-  }
-
-  setProcessing(true);
-  setSyncMessage("Saving completed shift...", false);
-  try {
-    const saved = await saveCompletedShift(completed);
-    updateLocalSubmissions((rows) => rows.map((row) => row.submissionId === completed.submissionId
-      ? { ...row, syncStatus: "saved", serverSubmissionId: saved.submissionId || "", error: "" }
-      : row
-    ));
-    setSyncMessage("Synced", false);
-    showToast(nextJobsite ? "Jobsite switched" : "Clocked out and synced");
-  } catch (error) {
-    console.error(error);
-    updateLocalSubmissions((rows) => rows.map((row) => row.submissionId === completed.submissionId
-      ? { ...row, syncStatus: "failed", error: error.message || "Save failed" }
-      : row
-    ));
-    showError(error.message ? `Not synced. ${error.message}` : "Not synced. Completed shift kept on this device.");
-  } finally {
-    setProcessing(false);
-    render();
-  }
-}
-
-async function saveCompletedShift(row) {
-  const token = await ensureSessionToken();
-  return apiPost("saveShift", {
-    token,
-    shift: {
-      clientShiftId: row.submissionId,
-      worker: currentUser.name,
-      date: row.date,
-      jobsite: row.jobsite,
-      startIso: row.startIso || row.startTime,
-      endIso: row.endIso || row.endTime,
-      lunch: row.lunch,
-      notes: ""
-    }
-  });
-}
-
-async function ensureSessionToken() {
-  if (currentUser?.sessionToken) return currentUser.sessionToken;
-  const data = await apiPost("login", { pin: currentUser.pin });
-  if (!data.token) throw new Error("Session could not be verified. Please log out and sign in again.");
-  currentUser.sessionToken = data.token;
-  currentUser.expiresAt = data.expiresAt || "";
-  return currentUser.sessionToken;
-}
-
-async function runSyncedAction(callback) {
-  setProcessing(true);
-  setSyncMessage("Syncing...", false);
-  try {
-    await callback();
-    setSyncMessage("Synced", false);
-    render();
-  } catch (error) {
-    console.error(error);
-    setSyncMessage("Not synced. Please try again.", true);
-    showError(error.message ? `Not synced. ${error.message}` : "Not synced. Please try again.");
-  } finally {
-    setProcessing(false);
-  }
-}
-
-function setProcessing(processing) {
-  isProcessing = processing;
-  [
-    els.clockButton,
-    els.switchButton,
-    els.lunchYesButton,
-    els.lunchNoButton,
-    els.switchConfirmButton,
-    els.switchCancelButton,
-    els.siteSelect
-  ].forEach((element) => {
-    if (element) element.disabled = processing;
-  });
-  render();
-}
-
-function setSyncMessage(message, isError) {
-  els.syncMessage.textContent = message;
-  els.syncMessage.classList.toggle("error", Boolean(isError));
-  els.syncStatus.textContent = isError ? "Not synced" : message || "Ready";
-}
-
-function renderClockOnly() {
-  els.liveClock.textContent = new Intl.DateTimeFormat([], {
-    timeZone: APP_TIME_ZONE,
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(new Date());
 }
 
 function render() {
-  if (!currentUser) return;
-  applyPermissions();
-  renderClockOnly();
+  if (!state.auth) {
+    renderPinDots();
+    return;
+  }
+  showApp();
+  renderShell();
+  renderClock();
+  if (isManagerMode()) {
+    renderOperations();
+    renderAlerts();
+  }
+}
 
-  const current = activeSubmission(currentUser.id);
-  const mySubmissions = sortSubmissions(submissionsFor(currentUser.id));
+function renderShell() {
+  els.workerName.textContent = currentWorker();
+  els.workerRole.textContent = currentRole() || "Employee";
+  const manager = isManagerMode();
+  els.managerTabs.hidden = !manager;
+  if (!manager) state.activeTab = "clock";
+  els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
+  els.views.forEach((view) => {
+    const key = view.id.replace("View", "");
+    view.classList.toggle("active", key === state.activeTab || (!manager && key === "clock"));
+  });
+}
 
-  if (current) {
-    els.statusPill.textContent = "CLOCKED IN";
-    els.statusPill.className = "status-pill in";
-    els.clockTitle.textContent = "Current Jobsite";
+function renderClock() {
+  renderJobsiteSelect(els.siteSelect, state.selectedJobsite);
+  const current = currentActiveShift();
+  const rows = completedRowsFor();
+  const lastRow = rows[0];
+  const site = findJobsite(current?.jobsite || state.selectedJobsite);
+  const canClock = payroll.jobsites.length > 0;
+  const absent = isAbsentToday();
+  const canMarkAbsent = absent || !hasClockedInToday();
+
+  els.liveClock.textContent = new Intl.DateTimeFormat([], {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: APP_TIME_ZONE,
+  }).format(new Date());
+  els.statusPanel.style.setProperty("--site-color", site?.colour || "#007f73");
+  els.siteSwatch.style.background = site?.colour || "#007f73";
+  els.clockButton.disabled = !canClock || absent;
+  els.switchButton.disabled = !canClock;
+  els.siteSelect.disabled = !!current || !canClock || absent;
+  els.absentButton.hidden = !canMarkAbsent;
+  els.absentButton.textContent = absent ? "Undo Absence" : "Mark Absent Today";
+  renderReminderPanel();
+
+  if (!apiReady()) {
+    els.statusPill.textContent = "Setup needed";
+    els.statusPill.className = "status-pill out";
+    els.clockTitle.textContent = "Add Web App URL";
+    els.statusDetail.textContent = "Deploy the backend and paste the URL in index.html.";
+  } else if (!payroll.jobsites.length) {
+    els.statusPill.textContent = "No jobsites";
+    els.statusPill.className = "status-pill out";
+    els.clockTitle.textContent = "Waiting for jobsites";
+    els.statusDetail.textContent = "Add Active jobsites in Payroll 2.0.";
+  } else if (absent) {
+    els.statusPill.textContent = "Absent";
+    els.statusPill.className = "status-pill out";
+    els.clockTitle.textContent = "Absent Today";
+    els.statusDetail.textContent = "No payroll hours created.";
+    els.clockButton.className = "primary-button";
+    els.clockButton.innerHTML = clockIcon() + " Clock In";
+    els.switchButton.hidden = true;
+    els.primaryActions.classList.remove("with-switch");
+  } else if (current) {
+    els.statusPill.textContent = "Clocked in";
+    els.statusPill.className = "status-pill";
+    els.clockTitle.textContent = shiftDurationLabel(current);
     els.statusDetail.textContent = current.jobsite;
-    els.statusDetail.hidden = false;
-    els.siteSelect.value = current.jobsite;
-    els.siteSelect.disabled = true;
     els.clockButton.className = "primary-button stop";
-    els.clockButton.innerHTML = clockIcon() + " Clock out";
+    els.clockButton.innerHTML = clockIcon() + " Clock Out";
     els.switchButton.hidden = false;
     els.primaryActions.classList.add("with-switch");
   } else {
-    els.statusPill.textContent = "CLOCKED OUT";
+    els.statusPill.textContent = "Clocked out";
     els.statusPill.className = "status-pill out";
-    els.clockTitle.textContent = "Ready for Jobsite";
-    els.statusDetail.textContent = "";
-    els.statusDetail.hidden = true;
-    els.siteSelect.disabled = isProcessing;
-    els.siteSelect.value = state.selectedSite || sites[0] || "";
+    els.clockTitle.textContent = "Ready for jobsite";
+    els.statusDetail.textContent = state.selectedJobsite || "Select jobsite";
     els.clockButton.className = "primary-button";
-    els.clockButton.innerHTML = clockIcon() + " Clock in";
+    els.clockButton.innerHTML = clockIcon() + " Clock In";
     els.switchButton.hidden = true;
     els.primaryActions.classList.remove("with-switch");
   }
 
-  els.clockButton.disabled = isProcessing;
-  els.switchButton.disabled = isProcessing;
-  els.lunchSummary.textContent = lunchSummaryLabel(mySubmissions, current);
-  els.todayRecordCount.textContent = String(mySubmissions.length);
-  els.entryCount.textContent = `${mySubmissions.length} ${mySubmissions.length === 1 ? "row" : "rows"}`;
-  renderTimeline(mySubmissions);
-  if (isManager()) renderManager();
+  els.syncStatus.textContent = syncStatusText();
+  els.lunchStatus.textContent = current ? "Pending" : lastRow ? lastRow.lunch : "Pending";
+  els.rowCount.textContent = String(rows.length);
+  els.entryCount.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  renderCompletedRows(rows);
 }
 
-function renderTimeline(items) {
-  if (!items.length) {
-    els.timelineList.innerHTML = `<p class="empty-state">No rows today</p>`;
+function renderCompletedRows(rows) {
+  if (!rows.length) {
+    els.timelineList.innerHTML = `<p class="empty-state">No completed rows today</p>`;
     return;
   }
 
-  els.timelineList.innerHTML = items
-    .map((row) => {
-      const status = row.endTime ? "Closed" : "Open";
-      const range = `${timeLabel(row.startTime)} - ${row.endTime ? timeLabel(row.endTime) : "Now"}`;
+  els.timelineList.innerHTML = rows
+    .map((shift) => {
+      const site = findJobsite(shift.jobsite);
+      const travel = travelLabel(shift);
       return `
-        <article class="entry-card simple-shift-card">
+        <article class="entry-card" style="--row-site-color:${escapeAttribute(site?.colour || "#007f73")}">
           <div class="entry-main">
             <div>
-              <span class="entry-title">${escapeHtml(row.jobsite)}</span>
-              <span class="entry-sub">${range}</span>
-              <span class="entry-sub">${lunchLabel(row)}</span>
+              <span class="entry-title">${escapeHtml(shift.jobsite)}</span>
+              <span class="entry-sub">${timeLabel(shift.start)} - ${timeLabel(shift.end)}</span>
+              <span class="entry-sub">Lunch: ${escapeHtml(shift.lunch)}</span>
+              ${travel ? `<span class="entry-sub">${escapeHtml(travel)}</span>` : ""}
+              ${shift.error ? `<span class="entry-sub">Save error: ${escapeHtml(shift.error)}</span>` : ""}
             </div>
-            <span class="mini-pill">${status}</span>
+            <span class="mini-pill ${syncClass(shift)}">${syncLabel(shift)}</span>
           </div>
         </article>
       `;
@@ -804,317 +778,255 @@ function renderTimeline(items) {
     .join("");
 }
 
-function renderManager() {
-  const alerts = findAlerts();
-  renderDailySummary();
-  renderAlerts(alerts);
-  updateAlertsTab(alerts.length);
+function renderReminderPanel() {
+  const required = attendanceRequiredFor();
+  els.reminderPanel.hidden = !required;
+  if (!required) return;
+
+  const permission = "Notification" in window ? Notification.permission : "unsupported";
+  const enabled = permission === "granted" && !!state.notificationEndpoint;
+  els.enableRemindersButton.disabled = enabled;
+  els.enableRemindersButton.textContent = enabled ? "Clock Reminders Enabled" : "Enable Clock Reminders";
+  if (state.reminderStatus) {
+    els.remindersStatus.textContent = state.reminderStatus;
+  } else if (permission === "denied") {
+    els.remindersStatus.textContent = "Notifications are blocked in this browser.";
+  } else {
+    els.remindersStatus.textContent = "Tap once on this device to receive clock reminders.";
+  }
 }
 
-function renderDailySummary() {
-  const todayRows = todayRowsOnly();
-  const checkedInIds = new Set(todayRows.map((row) => row.employeeId));
-  const activeRows = submissions.filter((row) => !row.endTime);
-  const activeBySite = groupBy(activeRows, (row) => row.jobsite || "Not Listed");
-  const activeSiteNames = Object.keys(activeBySite).sort((a, b) => a.localeCompare(b));
+function renderOperations() {
+  const activeEntries = Object.values(state.activeShifts).filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
+  const completed = state.shifts.filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
+  const todayStates = payroll.clockStates.filter((entry) => entry.date === todayKey());
+  const clockedInWorkers = new Set(activeEntries.map((shift) => shift.worker));
+  todayStates.filter((entry) => entry.status === "Clocked In").forEach((entry) => clockedInWorkers.add(entry.worker));
+  const absentWorkers = new Set(payroll.absences.filter((entry) => entry.date === todayKey() && entry.status === "Absent").map((entry) => entry.worker));
+  todayStates.filter((entry) => entry.status === "Absent").forEach((entry) => absentWorkers.add(entry.worker));
+  if (isAbsentToday()) absentWorkers.add(currentWorker());
+  const clockedOutWorkers = new Set(completed.map((shift) => shift.worker));
+  todayStates.filter((entry) => entry.status === "Clocked Out").forEach((entry) => clockedOutWorkers.add(entry.worker));
+  const totalHours = summarize(completed.concat(activeEntries)).workMs;
 
-  els.checkedInTodayCount.textContent = `🟢 Checked in today: ${checkedInIds.size}`;
+  els.clockedInCount.textContent = String(clockedInWorkers.size);
+  els.clockedOutCount.textContent = String([...clockedOutWorkers].filter((worker) => !clockedInWorkers.has(worker) && !absentWorkers.has(worker)).length);
+  els.teamHours.textContent = durationLabel(totalHours);
+  els.activeJobsiteCount.textContent = String(payroll.jobsites.length);
 
-  const workingCards = activeSiteNames.map((site) => {
-    const rows = activeBySite[site];
-    const color = safeColor(jobsiteMeta[site]?.color);
-    const people = rows
-      .map((row) => {
-        const employee = employees.find((item) => item.id === row.employeeId);
-        const route = routeForEmployeeToday(row.employeeId);
-        const hasTransfer = uniqueRouteSites(route).length > 1;
-        const isExpanded = expandedRouteEmployeeIds.has(row.employeeId);
-        const routeDetails = hasTransfer && isExpanded ? routeMarkup(route, row.jobsite) : "";
-        const transferIndicator = hasTransfer ? `<span class="transfer-indicator" aria-label="Transferred today">🔄</span>` : "";
-        const dataAttr = hasTransfer ? `data-route-employee="${escapeHtml(row.employeeId)}"` : "";
-        const buttonHint = hasTransfer ? `role="button" tabindex="0" aria-expanded="${isExpanded}"` : "";
-
-        return `
-          <div class="jobsite-worker ${hasTransfer ? "has-route" : ""}" ${dataAttr} ${buttonHint}>
-            <div class="worker-line">
-              <span class="worker-name">${escapeHtml(employee?.name || row.employeeName || "Unknown")} ${transferIndicator}</span>
-              <small>Since ${timeLabel(row.startTime)}</small>
-            </div>
-            ${routeDetails}
-          </div>
-        `;
-      })
-      .join("");
-
-    return `
-      <article class="jobsite-card" style="--site-color: ${color}">
-        <header>
-          <div>
-            <span class="jobsite-name">${escapeHtml(site)} (${rows.length})</span>
-          </div>
-          <span class="site-dot" aria-hidden="true"></span>
-        </header>
-        <div class="jobsite-workers">${people}</div>
-      </article>
-    `;
-  });
-
-  els.liveJobsiteList.innerHTML = workingCards.join("") || `<p class="empty-state">No one is currently clocked in.</p>`;
-  els.liveJobsiteList.querySelectorAll("[data-route-employee]").forEach((row) => {
-    row.addEventListener("click", () => toggleRoute(row.dataset.routeEmployee));
-    row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        toggleRoute(row.dataset.routeEmployee);
-      }
-    });
-  });
+  els.teamList.innerHTML = payroll.employees.length
+    ? payroll.employees
+        .map((employee) => {
+          const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
+          const active = state.activeShifts[employee.worker] || (stateRow?.status === "Clocked In" ? {
+            worker: employee.worker,
+            jobsite: stateRow.jobsite,
+            start: stateRow.clockInAt,
+          } : null);
+          const recent = state.shifts.find((shift) => shift.worker === employee.worker);
+          const absent = absentWorkers.has(employee.worker);
+          const clockedOut = !!recent || stateRow?.status === "Clocked Out";
+          const status = active ? "Clocked In" : absent ? "Absent" : clockedOut ? "Clocked Out" : "Not Clocked In";
+          const statusClass = active ? "" : absent ? "absent" : clockedOut ? "out" : "pending";
+          const currentJobsite = absent ? "Absent Today" : active?.jobsite || recent?.jobsite || stateRow?.jobsite || "No row today";
+          const since = active?.start
+            ? shiftDurationLabel(active)
+            : absent
+              ? "Marked absent"
+              : recent
+                ? `Last row ${timeLabel(recent.end)}`
+                : stateRow?.clockOutAt
+                  ? `Last row ${timeLabel(stateRow.clockOutAt)}`
+                  : "Not started";
+          return `
+            <article class="person-card">
+              <div class="avatar">${escapeHtml(initials(employee.worker))}</div>
+              <div class="person-main">
+                <div>
+                  <span class="person-name">${escapeHtml(employee.worker)}</span>
+                  <span class="person-sub">${escapeHtml(currentJobsite)}</span>
+                </div>
+                <span class="mini-pill ${statusClass}">${status}</span>
+              </div>
+              <footer>
+                <span class="muted">${escapeHtml(employee.role || "Employee")}</span>
+                <span class="muted">${escapeHtml(since)}</span>
+              </footer>
+            </article>
+          `;
+        })
+        .join("")
+    : `<p class="empty-state">No eligible active employees found in Payroll 2.0</p>`;
 }
 
-function renderAlerts(alerts) {
-  els.issueCount.textContent = alerts.length ? `🔴 ${alerts.length} Alerts` : "⚠️ Alerts";
-  els.issueCount.classList.toggle("alert-count", alerts.length > 0);
-
+function renderAlerts() {
+  const alerts = buildAlerts();
   if (!alerts.length) {
-    els.attentionList.innerHTML = `<p class="empty-state success-state">✅ No alerts today.</p>`;
+    els.alertsList.innerHTML = `<p class="empty-state">No alerts</p>`;
     return;
   }
 
-  const grouped = groupBy(alerts, (alert) => alert.type);
-  els.attentionList.innerHTML = ALERT_GROUPS
-    .filter((group) => grouped[group.key]?.length)
-    .map((group) => alertSectionMarkup(group, grouped[group.key]))
+  els.alertsList.innerHTML = alerts
+    .map((alert) => `
+      <article class="alert-card ${alert.severity.toLowerCase()}">
+        <span>${alert.severity}</span>
+        <strong>${escapeHtml(alert.title)}</strong>
+        <p>${escapeHtml(alert.detail)}</p>
+      </article>
+    `)
     .join("");
+}
 
-  els.attentionList.querySelectorAll("[data-alert-group]").forEach((section) => {
-    section.addEventListener("toggle", () => {
-      if (section.open) collapsedAlertGroupKeys.delete(section.dataset.alertGroup);
-      else collapsedAlertGroupKeys.add(section.dataset.alertGroup);
+function buildAlerts() {
+  const alerts = [];
+  const failed = state.shifts.filter((shift) => shift.syncStatus === "failed");
+  const pending = state.shifts.filter((shift) => shift.syncStatus === "pending");
+  const activeEntries = Object.values(state.activeShifts);
+
+  failed.forEach((shift) => {
+    alerts.push({
+      severity: shift.error?.toLowerCase().includes("unknown") ? "Critical" : "Warning",
+      title: shift.error?.toLowerCase().includes("duplicate") ? "Duplicate Submission" : "Save Failed",
+      detail: `${shift.worker} / ${shift.jobsite}: ${shift.error || "Save failed, try again."}`,
     });
   });
-}
-
-function alertSectionMarkup(group, alerts) {
-  const high = alerts.some((alert) => alert.severity === "high");
-  const isOpen = !collapsedAlertGroupKeys.has(group.key);
-  const items = alerts
-    .map((alert) => {
-      const detail = alert.detail ? `<span class="alert-detail">— ${escapeHtml(alert.detail)}</span>` : "";
-      return `
-        <li>
-          <span class="alert-person">${escapeHtml(alert.employee)}</span>
-          ${detail}
-        </li>
-      `;
-    })
-    .join("");
-
-  return `
-    <details class="alert-section ${high ? "high" : ""}" data-alert-group="${escapeHtml(group.key)}" ${isOpen ? "open" : ""}>
-      <summary>
-        <span>${escapeHtml(group.label)}</span>
-        <span class="alert-section-count">(${alerts.length})</span>
-      </summary>
-      <ul class="alert-items">
-        ${items}
-      </ul>
-    </details>
-  `;
-}
-
-function updateAlertsTab(count) {
-  if (!els.alertsTabLabel) return;
-  els.alertsTab.classList.toggle("has-alerts", count > 0);
-  els.alertsTabLabel.innerHTML = count
-    ? `<span class="alert-tab-icon">🔴</span> ${count} Alerts`
-    : `<span class="alert-tab-icon">⚠️</span> Alerts`;
-}
-
-function findAlerts() {
-  const alerts = [];
-  const todayRows = todayRowsOnly();
-  const employeeIdsWithRows = new Set(todayRows.map((row) => row.employeeId));
-
-  employees.forEach((employee) => {
-    if (!employeeIdsWithRows.has(employee.id)) {
+  if (pending.length) {
+    alerts.push({
+      severity: "Warning",
+      title: "Offline Saves Waiting",
+      detail: `${pending.length} completed row(s) are waiting to save to App Submissions.`,
+    });
+  }
+  activeEntries.forEach((shift) => {
+    const elapsed = workedMs(shift);
+    if (elapsed >= LONG_SHIFT_CRITICAL_MS) {
       alerts.push({
-        type: "notCheckedIn",
-        employeeId: employee.id,
-        employee: employee.name,
-        message: "Not Checked In Yet",
-        severity: "medium"
+        severity: "Critical",
+        title: "Missing Clock Out",
+        detail: `${shift.worker} has been clocked in for ${durationLabel(elapsed)}.`,
+      });
+    } else if (elapsed >= LONG_SHIFT_WARNING_MS) {
+      alerts.push({
+        severity: "Warning",
+        title: "Employee clocked in unusually long",
+        detail: `${shift.worker} has been clocked in for ${durationLabel(elapsed)}.`,
       });
     }
   });
-
-  todayRows.forEach((row) => {
-    if (!row.endTime && isStillClockedTooLong(row)) {
-      alerts.push({
-        type: "stillClockedIn",
-        employeeId: row.employeeId,
-        employee: employeeName(row),
-        message: "Still Clocked In",
-        detail: row.jobsite || "Not Listed",
-        severity: "high"
-      });
-    }
-
-    if (row.endTime && !row.lunch) {
-      alerts.push({
-        type: "lunchNotAnswered",
-        employeeId: row.employeeId,
-        employee: employeeName(row),
-        message: "Lunch Not Answered",
-        detail: row.jobsite || "Not Listed",
-        severity: "medium"
-      });
-    }
-
-    if (String(row.jobsite || "").trim().toLowerCase() === "not listed") {
-      alerts.push({
-        type: "notListedJobsite",
-        employeeId: row.employeeId,
-        employee: employeeName(row),
-        message: "Not Listed jobsite",
-        severity: "medium"
-      });
-    }
-
-    if (hasImportIssue(row)) {
-      alerts.push({
-        type: "syncImportIssue",
-        employeeId: row.employeeId,
-        employee: employeeName(row),
-        message: "Sync/import issue",
-        severity: "high"
-      });
-    }
-  });
-
+  if (!payroll.jobsites.length) {
+    alerts.push({
+      severity: "Warning",
+      title: "Unknown Jobsite",
+      detail: "No Active jobsites are available from App Jobsites Master.",
+    });
+  }
+  if (!payroll.employees.length) {
+    alerts.push({
+      severity: "Warning",
+      title: "Unknown Employee",
+      detail: "No eligible active employees are available from App Employees Master.",
+    });
+  }
+  if (state.shifts.some((shift) => shift.syncStatus === "saved")) {
+    alerts.push({
+      severity: "Information",
+      title: "Import Complete",
+      detail: "Saved rows are available in App Submissions for Payroll 2.0 import.",
+    });
+  }
+  if (state.lastSync === "Ready") {
+    alerts.push({
+      severity: "Information",
+      title: "Payroll 2.0 Connected",
+      detail: "Employee and jobsite lists refreshed successfully.",
+    });
+  }
   return alerts;
 }
 
-function employeeName(row) {
-  return employees.find((item) => item.id === row.employeeId)?.name || row.employeeName || "Unknown";
+function renderJobsiteSelect(select, selectedValue) {
+  const options = payroll.jobsites.map((jobsite) => {
+    return `<option value="${escapeHtml(jobsite.jobsite)}">${escapeHtml(jobsite.jobsite)}</option>`;
+  });
+  select.innerHTML = options.length ? options.join("") : `<option value="">No active jobsites</option>`;
+  select.value = selectedValue || payroll.jobsites[0]?.jobsite || "";
 }
 
-function toggleRoute(employeeId) {
-  if (expandedRouteEmployeeIds.has(employeeId)) expandedRouteEmployeeIds.delete(employeeId);
-  else expandedRouteEmployeeIds.add(employeeId);
-  renderManager();
+function syncStatusText() {
+  const rows = completedRowsFor();
+  const failed = rows.filter((shift) => shift.syncStatus === "failed").length;
+  const pending = rows.filter((shift) => shift.syncStatus === "pending").length;
+  if (failed) return "Save failed, try again";
+  if (pending) return "Saving";
+  return state.lastSync || "Ready";
 }
 
-function routeForEmployeeToday(employeeId) {
-  return sortSubmissionsAscending(submissionsFor(employeeId))
-    .map((row) => ({ time: timeLabel(row.startTime), site: row.jobsite || "Not Listed" }))
-    .filter((item, index, list) => index === 0 || item.site !== list[index - 1].site);
+function summarize(shifts) {
+  return shifts.reduce(
+    (totals, shift) => {
+      totals.workMs += workedMs(shift);
+      totals.jobsites.add(shift.jobsite);
+      return totals;
+    },
+    { workMs: 0, jobsites: new Set() }
+  );
 }
 
-function uniqueRouteSites(route) {
-  return [...new Set(route.map((item) => item.site))];
+function workedMs(shift) {
+  const end = shift.end ? new Date(shift.end) : new Date();
+  return Math.max(0, end - new Date(shift.start));
 }
 
-function routeMarkup(route, currentSite) {
-  return `
-    <div class="route-details">
-      <span class="route-title">Today's route</span>
-      ${route
-        .map((item) => `
-          <div class="route-row">
-            <span>${escapeHtml(item.time)}</span>
-            <span class="${item.site === currentSite ? "current-route-site" : ""}">${escapeHtml(item.site)}</span>
-          </div>
-        `)
-        .join("")}
-    </div>
-  `;
+function shiftDurationLabel(shift) {
+  return durationLabel(workedMs(shift));
 }
 
-function lunchSummaryLabel(rows, current) {
-  if (current) return "Pending";
-  const completed = rows.filter((row) => row.endTime).sort((a, b) => sortValue(b) - sortValue(a));
-  if (!completed.length) return "-";
-  return completed[0].lunch === "Yes" ? "30m" : "None";
+function durationLabel(ms) {
+  const minutes = Math.floor(ms / 60000);
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
-function lunchLabel(row) {
-  if (!row.endTime) return "Lunch pending";
-  if (row.lunch === "Yes") return "Lunch: 30m";
-  if (row.lunch === "No") return "Lunch: None";
-  return "Lunch: missing";
+function timeLabel(iso) {
+  if (!iso) return "";
+  return new Intl.DateTimeFormat([], {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: APP_TIME_ZONE,
+  }).format(new Date(iso));
 }
 
-function sortSubmissions(rows) {
-  return rows.slice().sort((a, b) => sortValue(b) - sortValue(a));
+function travelLabel(shift) {
+  if (shift.travelTo) return `Switched to ${shift.travelTo}`;
+  if (shift.travelFrom) return `Started after ${shift.travelFrom}`;
+  return "";
 }
 
-function sortSubmissionsAscending(rows) {
-  return rows.slice().sort((a, b) => sortValue(a) - sortValue(b));
+function syncLabel(shift) {
+  if (shift.syncStatus === "saved") return "Saved";
+  if (shift.syncStatus === "failed") return "Save failed";
+  return "Saving";
 }
 
-function sortValue(row) {
-  const parsed = Date.parse(row.startIso || `${row.date || todayKey()} ${row.startTime || ""}`);
-  if (Number.isFinite(parsed)) return parsed;
-  if (Number.isFinite(row.rowNumber) && row.rowNumber > 0) return row.rowNumber;
-  return 0;
+function syncClass(shift) {
+  if (shift.syncStatus === "saved") return "saved";
+  if (shift.syncStatus === "failed") return "failed";
+  if (shift.syncStatus === "pending") return "pending";
+  return "";
 }
 
-function todayRowsOnly() {
-  const today = todayKey();
-  return submissions.filter((row) => row.date === today);
+function findJobsite(name) {
+  return payroll.jobsites.find((jobsite) => jobsite.jobsite === name) || null;
 }
 
-function isStillClockedTooLong(row) {
-  const start = submissionDateTime(row, row.startTime);
-  if (!start) return false;
-  return Date.now() - start.getTime() >= 12 * 60 * 60 * 1000;
+function setConnection(mode, message) {
+  els.connectionBar.className = `connection-bar ${mode === "ready" ? "ready" : mode === "error" ? "error" : ""}`;
+  els.connectionText.textContent = message;
 }
 
-function submissionDateTime(row, timeValue) {
-  const date = row.date || todayKey();
-  const text = String(timeValue || "").trim();
-  if (!text) return null;
-  const parsed = new Date(`${date} ${text}`);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function hasImportIssue(row) {
-  const imported = String(row.imported || "").toLowerCase();
-  const importedAt = String(row.importedAt || "").toLowerCase();
-  return /error|fail|issue|sync/.test(`${imported} ${importedAt}`);
-}
-
-function groupBy(items, getKey) {
-  return items.reduce((map, item) => {
-    const key = getKey(item);
-    if (!map[key]) map[key] = [];
-    map[key].push(item);
-    return map;
-  }, {});
-}
-
-function safeColor(value) {
-  const color = String(value || "").trim();
-  return /^#[0-9a-fA-F]{6}$/.test(color) ? color : "#6B7280";
-}
-
-function timeLabel(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  const parsed = new Date(text);
-  if (!Number.isNaN(parsed.getTime()) && /[T:-]/.test(text)) {
-    return new Intl.DateTimeFormat([], {
-      timeZone: APP_TIME_ZONE,
-      hour: "numeric",
-      minute: "2-digit"
-    }).format(parsed);
-  }
-  return text;
-}
-
-function openConfiguredExport() {
-  if (!isManager() || !features.exportUrl) return;
-  window.open(features.exportUrl, "_blank", "noopener");
+function setLoginMessage(message, isError = false) {
+  els.loginMessage.textContent = message;
+  els.loginMessage.classList.toggle("error", isError);
 }
 
 function showToast(message) {
@@ -1124,9 +1036,47 @@ function showToast(message) {
   toastTimer = window.setTimeout(() => els.toast.classList.remove("show"), 2200);
 }
 
-function showError(message) {
-  setSyncMessage(message, true);
-  showToast(message);
+function todayKey(date = new Date()) {
+  return localDateKey(date);
+}
+
+function localDateKey(date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: APP_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .formatToParts(date)
+    .reduce((memo, part) => {
+      memo[part.type] = part.value;
+      return memo;
+    }, {});
+  const year = parts.year;
+  const month = parts.month;
+  const day = parts.day;
+  return `${year}-${month}-${day}`;
+}
+
+function newId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `shift-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replaceAll("-", "+").replaceAll("_", "/");
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
+}
+
+function initials(name) {
+  return String(name)
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || "")
+    .join("");
 }
 
 function clockIcon() {
@@ -1134,7 +1084,7 @@ function clockIcon() {
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -1142,24 +1092,15 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-async function start() {
-  try {
-    await loadConfig();
-    setup();
-  } catch (error) {
-    console.error(error);
-    document.body.innerHTML = `
-      <main class="app-shell config-error-shell">
-        <section class="config-error-card">
-          <h1>Crew Clock</h1>
-          <h2>Connection issue</h2>
-          <p>The app could not load employees and jobsites from Google Sheets.</p>
-          <p class="muted">${escapeHtml(error.message || "Unknown error")}</p>
-          <button class="primary-button" type="button" onclick="location.reload()">Try again</button>
-        </section>
-      </main>
-    `;
-  }
+function escapeAttribute(value) {
+  const text = String(value ?? "");
+  if (text.includes(";") || text.includes("{") || text.includes("}")) return "#007f73";
+  if (globalThis.CSS?.supports?.("color", text)) return text;
+  return "#007f73";
 }
 
-start();
+setup();
+
+window.addEventListener("beforeunload", () => {
+  if (renderTimer) window.clearInterval(renderTimer);
+});
