@@ -159,6 +159,10 @@ async function parseApiResponse(response) {
   return data;
 }
 
+function arrayOrEmpty(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function setup() {
   els.keypad.addEventListener("click", (event) => {
     const key = event.target.closest("button")?.dataset.key;
@@ -268,10 +272,10 @@ async function loadBootstrap(options = {}) {
   try {
     const data = await apiGet("bootstrap");
     payroll = {
-      employees: data.employees || [],
-      jobsites: data.jobsites || [],
-      absences: data.absences || [],
-      clockStates: data.clockStates || [],
+      employees: arrayOrEmpty(data.employees),
+      jobsites: arrayOrEmpty(data.jobsites),
+      absences: arrayOrEmpty(data.absences),
+      clockStates: arrayOrEmpty(data.clockStates),
       loadedAt: new Date().toISOString(),
     };
     const employee = currentEmployee();
