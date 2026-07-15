@@ -47,7 +47,6 @@ const els = {
   clockedInCount: document.querySelector("#clockedInCount"),
   clockedOutCount: document.querySelector("#clockedOutCount"),
   teamHours: document.querySelector("#teamHours"),
-  activeJobsiteCount: document.querySelector("#activeJobsiteCount"),
   teamList: document.querySelector("#teamList"),
   alertsList: document.querySelector("#alertsList"),
   retryButton: document.querySelector("#retryButton"),
@@ -812,51 +811,100 @@ function renderOperations() {
   els.clockedInCount.textContent = String(clockedInWorkers.size);
   els.clockedOutCount.textContent = String([...clockedOutWorkers].filter((worker) => !clockedInWorkers.has(worker) && !absentWorkers.has(worker)).length);
   els.teamHours.textContent = durationLabel(totalHours);
-  els.activeJobsiteCount.textContent = String(payroll.jobsites.length);
 
-  els.teamList.innerHTML = payroll.employees.length
-    ? payroll.employees
-        .map((employee) => {
-          const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
-          const active = state.activeShifts[employee.worker] || (stateRow?.status === "Clocked In" ? {
-            worker: employee.worker,
-            jobsite: stateRow.jobsite,
-            start: stateRow.clockInAt,
-          } : null);
-          const recent = state.shifts.find((shift) => shift.worker === employee.worker);
-          const absent = absentWorkers.has(employee.worker);
-          const clockedOut = !!recent || stateRow?.status === "Clocked Out";
-          const status = active ? "Clocked In" : absent ? "Absent" : clockedOut ? "Clocked Out" : "Not Clocked In";
-          const statusClass = active ? "" : absent ? "absent" : clockedOut ? "out" : "pending";
-          const currentJobsite = absent ? "Absent Today" : active?.jobsite || recent?.jobsite || stateRow?.jobsite || "No row today";
-          const since = active?.start
-            ? shiftDurationLabel(active)
-            : absent
-              ? "Marked absent"
-              : recent
-                ? `Last row ${timeLabel(recent.end)}`
-                : stateRow?.clockOutAt
-                  ? `Last row ${timeLabel(stateRow.clockOutAt)}`
-                  : "Not started";
-          return `
-            <article class="person-card">
-              <div class="avatar">${escapeHtml(initials(employee.worker))}</div>
-              <div class="person-main">
-                <div>
-                  <span class="person-name">${escapeHtml(employee.worker)}</span>
-                  <span class="person-sub">${escapeHtml(currentJobsite)}</span>
-                </div>
-                <span class="mini-pill ${statusClass}">${status}</span>
-              </div>
-              <footer>
-                <span class="muted">${escapeHtml(employee.role || "Employee")}</span>
-                <span class="muted">${escapeHtml(since)}</span>
-              </footer>
-            </article>
-          `;
-        })
-        .join("")
-    : `<p class="empty-state">No eligible active employees found in Payroll 2.0</p>`;
+  const groups = buildOperationsGroups(absentWorkers);
+  els.teamList.innerHTML = groups.length
+    ? groups.map(renderOperationsGroup).join("")
+    : `<p class="empty-state">No clocked-in, clocked-out, or absent employees today</p>`;
+}
+
+function buildOperationsGroups(absentWorkers) {
+  const groups = new Map();
+  const absentGroup = {
+    jobsite: "Absent Today",
+    colour: "#b42318",
+    people: [],
+    absent: true,
+  };
+
+  payroll.employees.forEach((employee) => {
+    const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
+    const active = state.activeShifts[employee.worker] || (stateRow?.status === "Clocked In" ? {
+      worker: employee.worker,
+      jobsite: stateRow.jobsite,
+      start: stateRow.clockInAt,
+    } : null);
+    const recent = state.shifts.find((shift) => shift.worker === employee.worker);
+    const absent = absentWorkers.has(employee.worker);
+    const clockedOut = !!recent || stateRow?.status === "Clocked Out";
+
+    if (!active && !absent && !clockedOut) return;
+
+    if (absent) {
+      absentGroup.people.push({
+        worker: employee.worker,
+        status: "Absent",
+        statusClass: "absent",
+        clockIn: "",
+      });
+      return;
+    }
+
+    const jobsite = active?.jobsite || recent?.jobsite || stateRow?.jobsite || "Unknown Jobsite";
+    const site = findJobsite(jobsite);
+    if (!groups.has(jobsite)) {
+      groups.set(jobsite, {
+        jobsite,
+        colour: site?.colour || "#007f73",
+        people: [],
+      });
+    }
+
+    groups.get(jobsite).people.push({
+      worker: employee.worker,
+      status: active ? "Clocked In" : "Clocked Out",
+      statusClass: active ? "" : "out",
+      clockIn: active?.start || recent?.start || stateRow?.clockInAt || "",
+    });
+  });
+
+  const jobsiteGroups = [...groups.values()]
+    .filter((group) => group.people.length)
+    .sort((a, b) => a.jobsite.localeCompare(b.jobsite));
+
+  if (absentGroup.people.length) jobsiteGroups.push(absentGroup);
+  return jobsiteGroups;
+}
+
+function renderOperationsGroup(group) {
+  const colour = escapeAttribute(group.colour || "#007f73");
+  return `
+    <section class="jobsite-group" style="--row-site-color:${colour}">
+      <header class="jobsite-group-header">
+        <span class="jobsite-colour" aria-hidden="true"></span>
+        <strong>${escapeHtml(group.jobsite)}</strong>
+        <span>${group.people.length}</span>
+      </header>
+      <div class="jobsite-crew">
+        ${group.people.map(renderOperationsPerson).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderOperationsPerson(person) {
+  return `
+    <article class="person-card">
+      <div class="avatar">${escapeHtml(initials(person.worker))}</div>
+      <div class="person-main">
+        <div>
+          <span class="person-name">${escapeHtml(person.worker)}</span>
+          ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
+        </div>
+        <span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>
+      </div>
+    </article>
+  `;
 }
 
 function renderAlerts() {

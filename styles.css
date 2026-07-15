@@ -545,7 +545,7 @@ textarea {
 }
 
 .manager-metrics {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .employee-facts article,
@@ -567,10 +567,6 @@ textarea {
 .employee-facts article:nth-child(3),
 .manager-metrics article:nth-child(3) {
   border-top-color: var(--blue);
-}
-
-.manager-metrics article:nth-child(4) {
-  border-top-color: var(--yellow);
 }
 
 .employee-facts span,
@@ -596,6 +592,57 @@ textarea {
   display: grid;
   gap: 10px;
   margin-top: 12px;
+}
+
+.team-list {
+  gap: 12px;
+}
+
+.jobsite-group {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.jobsite-group-header {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  min-height: 44px;
+  padding: 10px 12px;
+  border-top: 4px solid var(--row-site-color, var(--teal));
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfd;
+}
+
+.jobsite-group-header strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobsite-group-header span:last-child {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.jobsite-colour {
+  width: 14px;
+  height: 14px;
+  border: 1px solid rgba(17, 24, 39, 0.16);
+  border-radius: 4px;
+  background: var(--row-site-color, var(--teal));
+}
+
+.jobsite-crew {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
 }
 
 .entry-card,
@@ -652,7 +699,7 @@ textarea {
 
 .person-card {
   grid-template-columns: 42px minmax(0, 1fr);
-  border-left-color: var(--blue);
+  border-left-color: var(--row-site-color, var(--blue));
 }
 
 .person-card footer {
