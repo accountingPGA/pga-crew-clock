@@ -4,9 +4,11 @@ const CONFIG = {
 };
 
 const STORAGE_KEY = "pga-crew-clock-payroll-v2";
+const DEVICE_KEY = "pga-crew-clock-device-id";
 const API_PLACEHOLDER = "PASTE_APPS_SCRIPT_WEB_APP_URL_HERE";
 const VAPID_PLACEHOLDER = "PASTE_WEB_PUSH_VAPID_PUBLIC_KEY_HERE";
 const APP_TIME_ZONE = "America/Vancouver";
+const OPERATIONS_REFRESH_MS = 30000;
 const LONG_SHIFT_WARNING_MS = 10 * 60 * 60 * 1000;
 const LONG_SHIFT_CRITICAL_MS = 12 * 60 * 60 * 1000;
 
@@ -77,11 +79,14 @@ let pinBuffer = "";
 let pendingClockOutShiftId = null;
 let toastTimer;
 let renderTimer;
+let operationsRefreshTimer;
+let bootstrapLoading = false;
 let serviceWorkerRegistration = null;
 
 function defaultState() {
   return {
     day: todayKey(),
+    deviceId: getOrCreateDeviceId(),
     auth: null,
     selectedJobsite: "",
     activeShifts: {},
@@ -110,6 +115,14 @@ function loadState() {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function getOrCreateDeviceId() {
+  const existing = localStorage.getItem(DEVICE_KEY);
+  if (existing) return existing;
+  const deviceId = newId();
+  localStorage.setItem(DEVICE_KEY, deviceId);
+  return deviceId;
 }
 
 function apiReady() {
@@ -177,6 +190,7 @@ function setup() {
 
   registerServiceWorker();
   renderTimer = window.setInterval(render, 1000);
+  operationsRefreshTimer = window.setInterval(refreshOperationsIfOpen, OPERATIONS_REFRESH_MS);
   if (state.auth) {
     showApp();
     loadBootstrap();
@@ -247,8 +261,10 @@ async function loginWithPin() {
   }
 }
 
-async function loadBootstrap() {
-  setConnection("loading", "Refreshing Payroll 2.0");
+async function loadBootstrap(options = {}) {
+  if (bootstrapLoading) return;
+  bootstrapLoading = true;
+  if (!options.quiet) setConnection("loading", "Refreshing Payroll 2.0");
   try {
     const data = await apiGet("bootstrap");
     payroll = {
@@ -265,14 +281,22 @@ async function loadBootstrap() {
     if (!payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
       state.selectedJobsite = payroll.jobsites[0]?.jobsite || "";
     }
+    restoreCurrentOpenShift();
     state.lastSync = "Ready";
     saveState();
-    setConnection("ready", "Connected to Payroll 2.0");
+    if (!options.quiet) setConnection("ready", "Connected to Payroll 2.0");
   } catch (error) {
     state.lastSync = "Connection failed";
-    setConnection("error", error.message);
+    if (!options.quiet) setConnection("error", error.message);
   } finally {
+    bootstrapLoading = false;
     render();
+  }
+}
+
+function refreshOperationsIfOpen() {
+  if (state.auth && isManagerMode() && state.activeTab === "operations") {
+    loadBootstrap({ quiet: true });
   }
 }
 
@@ -299,6 +323,7 @@ function setActiveTab(tab) {
   state.activeTab = tab;
   saveState();
   render();
+  if (tab === "operations") loadBootstrap({ quiet: true });
 }
 
 function currentWorker() {
@@ -336,6 +361,25 @@ function activeShiftFor(worker) {
   return state.activeShifts[worker] || null;
 }
 
+function restoreCurrentOpenShift() {
+  const worker = currentWorker();
+  if (!worker) return;
+  const open = payroll.clockStates.find((entry) => entry.worker === worker && entry.date === todayKey() && entry.status === "Clocked In");
+  if (!open?.clockInAt || !open.jobsite) {
+    return;
+  }
+
+  const existing = state.activeShifts[worker];
+  state.activeShifts[worker] = {
+    id: open.sessionId || existing?.id || newId(),
+    worker,
+    jobsite: open.jobsite,
+    start: open.clockInAt,
+    restored: true,
+  };
+  state.selectedJobsite = open.jobsite;
+}
+
 function hasClockedInToday(worker = currentWorker()) {
   const status = clockStateFor(worker)?.status;
   return !!activeShiftFor(worker) || completedRowsFor(worker).length > 0 || status === "Clocked In" || status === "Clocked Out";
@@ -370,16 +414,24 @@ async function toggleClock() {
     return;
   }
 
-  state.activeShifts[currentWorker()] = {
+  const nextShift = {
     id: newId(),
     worker: currentWorker(),
     jobsite: state.selectedJobsite || payroll.jobsites[0].jobsite,
     start: new Date().toISOString(),
   };
-  saveState();
-  render();
-  recordClockState("Clocked In", state.activeShifts[currentWorker()]);
-  showToast("Clocked in");
+  setConnection("loading", "Opening shift");
+  try {
+    await recordClockState("Clocked In", nextShift);
+    state.activeShifts[currentWorker()] = nextShift;
+    saveState();
+    setConnection("ready", "Clocked in");
+    render();
+    showToast("Clocked in");
+  } catch (error) {
+    setConnection("error", error.message || "Clock In failed");
+    showToast("Clock In failed");
+  }
 }
 
 async function finishClockOut(lunch) {
@@ -394,6 +446,7 @@ async function finishClockOut(lunch) {
     ...current,
     end: new Date().toISOString(),
     lunch,
+    clearOpenShift: true,
     syncStatus: "pending",
   };
   delete state.activeShifts[currentWorker()];
@@ -401,7 +454,11 @@ async function finishClockOut(lunch) {
   state.lastSync = "Saving";
   saveState();
   render();
-  recordClockState("Clocked Out", completed);
+  try {
+    await recordClockState("Clocked Out", completed);
+  } catch (error) {
+    setConnection("error", error.message || "Open shift close failed");
+  }
   await saveCompletedShift(completed);
 }
 
@@ -449,7 +506,8 @@ async function markAbsentToday() {
       token: state.auth?.token,
       date: todayKey(),
     });
-    await recordClockState("Absent", {});
+    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
+    payroll.clockStates.push({ worker: currentWorker(), date: todayKey(), status: "Absent", jobsite: "", clockInAt: "", clockOutAt: "" });
     setConnection("ready", "Absent Today saved");
     showToast("Absent Today saved");
   } catch (error) {
@@ -472,7 +530,7 @@ async function undoAbsenceToday() {
       token: state.auth?.token,
       date: todayKey(),
     });
-    await recordClockState("Not Clocked In", {});
+    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
     setConnection("ready", "Absence removed");
     showToast("Absence removed");
   } catch (error) {
@@ -500,41 +558,46 @@ async function switchJobsite() {
     syncStatus: "pending",
   };
 
-  state.activeShifts[currentWorker()] = {
+  const nextShift = {
     id: newId(),
     worker: currentWorker(),
     jobsite: nextJobsite,
     start: now,
     travelFrom: current.jobsite,
   };
+  state.activeShifts[currentWorker()] = nextShift;
   state.selectedJobsite = nextJobsite;
   state.shifts.unshift(completed);
   state.lastSync = "Saving";
   closeSwitchDialog();
   saveState();
   render();
-  recordClockState("Clocked In", state.activeShifts[currentWorker()]);
+  try {
+    await recordClockState("Clocked In", nextShift);
+  } catch (error) {
+    setConnection("error", error.message || "Open shift update failed");
+    showToast("Open shift update failed");
+  }
   await saveCompletedShift(completed);
   showToast("New jobsite started");
 }
 
 async function recordClockState(status, shift = {}) {
   if (!state.auth || !apiReady()) return;
-  try {
-    const payload = {
-      token: state.auth.token,
-      status,
-      date: todayKey(),
-      jobsite: shift.jobsite || "",
-      clockInAt: shift.start || "",
-      clockOutAt: shift.end || "",
-    };
-    const data = await apiPost("clockState", payload);
-    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
-    payroll.clockStates.push(data.clockState || { worker: currentWorker(), date: todayKey(), status });
-  } catch {
-    // Payroll saving stays independent from reminder state updates.
-  }
+  const payload = {
+    token: state.auth.token,
+    status,
+    date: todayKey(),
+    jobsite: shift.jobsite || "",
+    clockInAt: shift.start || "",
+    clockOutAt: shift.end || "",
+    sessionId: shift.id || "",
+    deviceId: state.deviceId || "",
+  };
+  const data = await apiPost("clockState", payload);
+  payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
+  payroll.clockStates.push(data.clockState || { worker: currentWorker(), date: todayKey(), status });
+  return data;
 }
 
 async function saveCompletedShift(shift) {
@@ -649,6 +712,7 @@ function toSubmissionPayload(shift) {
     endIso: shift.end,
     lunch: shift.lunch === "Yes" ? "Yes" : "No",
     notes: "",
+    clearOpenShift: !!shift.clearOpenShift,
   };
 }
 
@@ -1151,4 +1215,5 @@ setup();
 
 window.addEventListener("beforeunload", () => {
   if (renderTimer) window.clearInterval(renderTimer);
+  if (operationsRefreshTimer) window.clearInterval(operationsRefreshTimer);
 });
