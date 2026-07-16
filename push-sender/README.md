@@ -1,31 +1,47 @@
 # PGA Crew Clock Push Sender
 
-This service sends encrypted Web Push notifications for PGA Crew Clock. It is intended to run on Google Cloud Run.
+This Cloud Run service is the secure notification sender for PGA Crew Clock. Apps Script decides who should be notified, then calls `POST /send`; this service validates the shared sender token and delivers the notification through Firebase Cloud Messaging.
 
-## Required Secrets
+## Required Configuration
 
-- `VAPID_PRIVATE_KEY`: private Web Push VAPID key. Never commit this.
-- `PUSH_SENDER_TOKEN`: shared bearer token used by Apps Script when calling `/send`. Never commit this.
+- `PUSH_SENDER_TOKEN`: Secret Manager value shared only with Apps Script.
+- `FIREBASE_PROJECT_ID`: Firebase/GCP project ID for PGA Crew Clock Push.
+- `APP_URL`: production GitHub Pages URL, normally `https://accountingpga.github.io/pga-crew-clock/`.
+- `APP_ICON_URL`: notification icon URL.
+- `PUSH_TTL_SECONDS`: optional, defaults to `3600`.
 
-To rotate the VAPID key pair later, run:
+Use Cloud Run's runtime service account with Application Default Credentials for FCM. A Firebase service account JSON key is not required. If a JSON key is used anyway, store it in Secret Manager as `FCM_SERVICE_ACCOUNT_JSON`; never commit it.
 
-```bash
-node generate-vapid.js
-```
+## Optional Legacy Web Push Fallback
 
-Then update the frontend public key and the Cloud Run private-key secret together.
+The service still supports the old encrypted Web Push payload shape while devices transition to FCM tokens. To keep that fallback enabled, set:
 
-## Public Configuration
+- `VAPID_SUBJECT`
+- `VAPID_PUBLIC_KEY`
+- `VAPID_PRIVATE_KEY`
 
-- `VAPID_PUBLIC_KEY`: safe for the frontend. This must match `window.CREW_CLOCK_CONFIG.vapidPublicKey` in `index.html`.
-- `VAPID_SUBJECT`: contact subject for VAPID, usually the production app URL or a `mailto:` address.
+`VAPID_PRIVATE_KEY` must remain in Secret Manager only.
 
 ## Endpoints
 
 - `GET /health`: health check.
 - `POST /send`: authenticated sender endpoint called by `CrewClockBackend.gs`.
 
-`POST /send` expects:
+FCM request shape:
+
+```json
+{
+  "fcmToken": "device-fcm-registration-token",
+  "notification": {
+    "title": "PGA Crew Clock",
+    "body": "⏰ Don't forget to clock in.",
+    "url": "./index.html",
+    "tag": "pga-worker-date-time"
+  }
+}
+```
+
+Legacy fallback request shape:
 
 ```json
 {
@@ -38,48 +54,28 @@ Then update the frontend public key and the Cloud Run private-key secret togethe
   },
   "notification": {
     "title": "PGA Crew Clock",
-    "body": "⏰ Don't forget to clock in.",
+    "body": "Tap to open Crew Clock.",
     "url": "./index.html",
     "tag": "pga-worker-date-time"
   }
 }
 ```
 
-## Cloud Run Deployment
+## Deploy
 
-Use a Google Cloud project with Cloud Run, Cloud Build, Artifact Registry, and Secret Manager enabled. The Cloud Run runtime service account only needs permission to read the two secrets if you mount them through Secret Manager.
+From this folder:
 
-1. Create two local files outside the repository:
+```bash
+gcloud run deploy pga-crew-clock-push-sender \
+  --source . \
+  --region northamerica-northeast1 \
+  --allow-unauthenticated \
+  --set-env-vars FIREBASE_PROJECT_ID="$PROJECT_ID",APP_URL=https://accountingpga.github.io/pga-crew-clock/,APP_ICON_URL=https://accountingpga.github.io/pga-crew-clock/assets/PINNACLE.png,PUSH_TTL_SECONDS=3600 \
+  --set-secrets PUSH_SENDER_TOKEN=pga-crew-clock-push-sender-token:latest
+```
 
-   - `vapid-private-key.txt`
-   - `push-sender-token.txt`
+After deployment, set the Apps Script property `PUSH_SENDER_URL` to:
 
-2. Create Secret Manager secrets:
-
-   ```bash
-   gcloud secrets create pga-crew-clock-vapid-private-key --data-file=vapid-private-key.txt
-   gcloud secrets create pga-crew-clock-push-sender-token --data-file=push-sender-token.txt
-   ```
-
-3. Deploy:
-
-   ```bash
-   gcloud run deploy pga-crew-clock-push-sender \
-     --source . \
-     --region northamerica-northeast1 \
-     --allow-unauthenticated \
-     --set-env-vars VAPID_SUBJECT=https://accountingpga.github.io/pga-crew-clock/,VAPID_PUBLIC_KEY=BD-c7u13VWKTjGRJabSz6NfuBGEhaQm5pbjAjQ13XEyzqDqS3Pr9eIApZ2pD4ahXqI12OWzjhScdbuRaspG93eU,PUSH_TTL_SECONDS=3600 \
-     --set-secrets VAPID_PRIVATE_KEY=pga-crew-clock-vapid-private-key:latest,PUSH_SENDER_TOKEN=pga-crew-clock-push-sender-token:latest
-   ```
-
-4. Copy the Cloud Run service URL. The Apps Script property `PUSH_SENDER_URL` must be:
-
-   ```text
-   https://YOUR-CLOUD-RUN-URL/send
-   ```
-
-5. Set the Apps Script property `PUSH_SENDER_TOKEN` to the same value from `push-sender-token.txt`.
-
-6. Redeploy the existing Apps Script Web App as a new version while keeping the same Web App URL.
-
-7. Run `installCrewClockReminderTrigger()` once in Apps Script.
+```text
+https://YOUR-CLOUD-RUN-SERVICE-URL/send
+```
