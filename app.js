@@ -987,13 +987,23 @@ function renderClock() {
   els.absentButton.hidden = !canShowAbsentAction;
   els.absentButton.textContent = "MARK ABSENT";
   renderReminderPanel();
-  const problem = clockStatusProblem(canClock);
+  const connecting = !apiReady();
+  const problem = !connecting && clockStatusProblem(canClock);
   els.statusPanel.classList.toggle("clocked-in", !!current);
   els.statusPanel.classList.toggle("clocked-out", !current);
   els.statusPanel.classList.toggle("status-problem", !!problem);
   els.clockTitle.textContent = currentWorker();
-  els.statusPill.textContent = problem ? "🔴 Please Contact Admin (Gwyneth)" : "🟢 Ready for Clock In";
-  els.statusPill.className = `status-pill ${problem ? "problem" : "ready"}`;
+
+  if (problem) {
+    els.statusPill.textContent = "🔴 Offline";
+    els.statusPill.className = "status-pill problem";
+  } else if (connecting) {
+    els.statusPill.textContent = "🟡 Connecting...";
+    els.statusPill.className = "status-pill connecting";
+  } else {
+    els.statusPill.textContent = "🟢 Ready for Clock In";
+    els.statusPill.className = "status-pill ready";
+  }
 
   if (!apiReady()) {
     els.statusDetail.textContent = "";

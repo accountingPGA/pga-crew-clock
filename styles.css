@@ -1121,3 +1121,10 @@ textarea {
     font-size: 13px;
   }
 }
+
+/* Clock connection status: temporary connecting state */
+.status-pill.connecting {
+  background: #fff4cc;
+  color: #9a6700;
+  border-color: #f2c94c;
+}
