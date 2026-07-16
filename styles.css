@@ -427,6 +427,12 @@ h2 {
   margin-top: 0;
 }
 
+#clockView .notification-button {
+  min-height: 48px;
+  margin-top: -4px;
+  font-size: 15px;
+}
+
 .status-topline,
 .section-heading,
 .team-head {
@@ -1122,8 +1128,7 @@ textarea {
   }
 }
 
-/* Clock connection status: temporary connecting state */
-.status-pill.connecting {
+#clockView .status-pill.connecting {
   background: #fff4cc;
   color: #9a6700;
   border-color: #f2c94c;

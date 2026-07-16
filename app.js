@@ -42,6 +42,7 @@ const els = {
   clockButton: document.querySelector("#clockButton"),
   switchButton: document.querySelector("#switchButton"),
   absentButton: document.querySelector("#absentButton"),
+  notificationButton: document.querySelector("#notificationButton"),
   reminderPanel: document.querySelector("#reminderPanel"),
   enableRemindersButton: document.querySelector("#enableRemindersButton"),
   remindersStatus: document.querySelector("#remindersStatus"),
@@ -188,6 +189,7 @@ function setup() {
   els.clockButton.addEventListener("click", toggleClock);
   els.switchButton.addEventListener("click", openSwitchDialog);
   els.absentButton.addEventListener("click", handleAbsentButton);
+  els.notificationButton.addEventListener("click", enableClockReminders);
   els.enableRemindersButton.addEventListener("click", enableClockReminders);
   els.retryButton.addEventListener("click", retryFailedSaves);
   els.lunchYesButton.addEventListener("click", () => handleLunchAnswer("Yes"));
@@ -972,7 +974,10 @@ function renderClock() {
   const site = findJobsite(current?.jobsite || state.selectedJobsite);
   const canClock = payroll.jobsites.length > 0;
   const absent = isAbsentToday();
+  const clockDataReady = !bootstrapLoading && !!payroll.loadedAt;
   const canShowAbsentAction = !current && !absent && !hasClockedInToday();
+  const connectionStatus = clockConnectionStatus();
+  const connectionReady = connectionStatus.state === "ready";
 
   els.liveClock.textContent = new Intl.DateTimeFormat([], {
     hour: "numeric",
@@ -981,39 +986,28 @@ function renderClock() {
   }).format(new Date());
   els.statusPanel.style.setProperty("--site-color", site?.colour || "#007f73");
   els.siteSwatch.style.background = site?.colour || "#007f73";
-  els.clockButton.disabled = !canClock || absent;
-  els.switchButton.disabled = !canClock;
-  els.siteSelect.disabled = !!current || !canClock || absent;
-  els.absentButton.hidden = !canShowAbsentAction;
+  els.clockButton.disabled = !connectionReady || !canClock || absent;
+  els.switchButton.disabled = !connectionReady || !canClock;
+  const siteSelectDisabled = !connectionReady || !!current || !canClock || absent;
+  if (document.activeElement !== els.siteSelect && els.siteSelect.disabled !== siteSelectDisabled) {
+    els.siteSelect.disabled = siteSelectDisabled;
+  }
+  els.absentButton.hidden = !connectionReady || !clockDataReady || !canShowAbsentAction;
   els.absentButton.textContent = "MARK ABSENT";
   renderReminderPanel();
-  const connecting = !apiReady();
-  const problem = !connecting && clockStatusProblem(canClock);
+  const problem = connectionStatus.state === "offline";
   els.statusPanel.classList.toggle("clocked-in", !!current);
   els.statusPanel.classList.toggle("clocked-out", !current);
   els.statusPanel.classList.toggle("status-problem", !!problem);
   els.clockTitle.textContent = currentWorker();
-
-  if (problem) {
-    els.statusPill.textContent = "🔴 Offline";
-    els.statusPill.className = "status-pill problem";
-  } else if (connecting) {
-    els.statusPill.textContent = "🟡 Connecting...";
-    els.statusPill.className = "status-pill connecting";
-  } else {
-    els.statusPill.textContent = "🟢 Ready for Clock In";
-    els.statusPill.className = "status-pill ready";
-  }
+  els.statusPill.textContent = connectionStatus.text;
+  els.statusPill.className = `status-pill ${connectionStatus.className}`;
 
   if (!apiReady()) {
     els.statusDetail.textContent = "";
   } else if (!payroll.jobsites.length) {
     els.statusDetail.textContent = "";
   } else if (absent) {
-    if (!problem) {
-      els.statusPill.textContent = "🟢 Absent Today";
-      els.statusPill.className = "status-pill ready";
-    }
     els.statusDetail.textContent = "";
     els.clockButton.className = "primary-button";
     els.clockButton.textContent = "CLOCK IN";
@@ -1041,10 +1035,20 @@ function renderClock() {
   renderCompletedRows(rows);
 }
 
-function clockStatusProblem(canClock) {
-  if (!apiReady()) return true;
-  if (!canClock) return true;
-  return els.connectionBar.classList.contains("error");
+function clockConnectionStatus() {
+  if (!apiReady()) {
+    return { state: "offline", text: "🔴 Offline", className: "problem" };
+  }
+  if (bootstrapLoading) {
+    return { state: "connecting", text: "🟡 Connecting...", className: "connecting" };
+  }
+  if (state.lastSync === "Connection failed" || els.connectionBar.classList.contains("error")) {
+    return { state: "offline", text: "🔴 Offline", className: "problem" };
+  }
+  if (!payroll.loadedAt) {
+    return { state: "connecting", text: "🟡 Connecting...", className: "connecting" };
+  }
+  return { state: "ready", text: "🟢 Ready for Clock In", className: "ready" };
 }
 
 function renderCompletedRows(rows) {
@@ -1077,11 +1081,14 @@ function renderCompletedRows(rows) {
 
 function renderReminderPanel() {
   const canEnable = canEnableDeviceNotifications();
-  els.reminderPanel.hidden = !canEnable;
-  if (!canEnable) return;
-
   const permission = "Notification" in window ? Notification.permission : "unsupported";
   const enabled = permission === "granted" && !!state.notificationEndpoint;
+  const canRequestPermission = canEnable && permission === "default";
+  els.reminderPanel.hidden = true;
+  els.notificationButton.hidden = !canRequestPermission;
+  els.notificationButton.disabled = false;
+  if (!canEnable) return;
+
   els.enableRemindersButton.disabled = enabled;
   const buttonLabel = attendanceRequiredFor() ? "Clock Reminders" : "Manager Notifications";
   els.enableRemindersButton.textContent = enabled ? `${buttonLabel} Enabled` : `Enable ${buttonLabel}`;
@@ -1463,8 +1470,22 @@ function renderJobsiteSelect(select, selectedValue) {
   const options = payroll.jobsites.map((jobsite) => {
     return `<option value="${escapeHtml(jobsite.jobsite)}">${escapeHtml(jobsite.jobsite)}</option>`;
   });
-  select.innerHTML = options.length ? options.join("") : `<option value="">No active jobsites</option>`;
-  select.value = selectedValue || payroll.jobsites[0]?.jobsite || "";
+  const optionsHtml = options.length ? options.join("") : `<option value="">No active jobsites</option>`;
+  const optionsSignature = JSON.stringify(payroll.jobsites.map((jobsite) => jobsite.jobsite));
+  const desiredValue = selectedValue || payroll.jobsites[0]?.jobsite || "";
+
+  if (document.activeElement === select) {
+    return;
+  }
+
+  if (select.dataset.optionsSignature !== optionsSignature) {
+    select.innerHTML = optionsHtml;
+    select.dataset.optionsSignature = optionsSignature;
+  }
+
+  if (select.value !== desiredValue) {
+    select.value = desiredValue;
+  }
 }
 
 function syncStatusText() {
