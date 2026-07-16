@@ -333,6 +333,100 @@ h2 {
   border-top: 4px solid var(--site-color);
 }
 
+#clockView .reminder-panel,
+#clockView .employee-facts,
+#clockView .timeline-panel {
+  display: none;
+}
+
+#clockView .status-panel {
+  display: grid;
+  gap: 18px;
+  padding: 20px 16px;
+}
+
+#clockView .status-panel h2 {
+  margin-top: 0;
+  font-size: 30px;
+  line-height: 1.05;
+}
+
+#clockView .status-topline {
+  justify-content: flex-start;
+}
+
+#clockView .live-clock {
+  display: none;
+}
+
+#clockView .status-pill {
+  min-height: auto;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--success);
+  font-size: 17px;
+  line-height: 1.25;
+  white-space: normal;
+}
+
+#clockView .status-pill.problem {
+  color: var(--danger);
+}
+
+#clockView .status-panel.clocked-in:not(.status-problem) .status-topline {
+  display: none;
+}
+
+#clockView .status-panel.clocked-in .shift-controls {
+  display: none;
+}
+
+#clockView .status-detail:empty {
+  display: none;
+}
+
+#clockView .status-panel.clocked-in .status-detail {
+  display: block;
+  margin-top: 0;
+  color: var(--ink);
+  font-size: 30px;
+  font-weight: 840;
+  line-height: 1.05;
+}
+
+#clockView .shift-controls {
+  margin-top: 0;
+}
+
+#clockView .shift-controls label {
+  font-size: 15px;
+}
+
+#clockView select {
+  min-height: 56px;
+  font-size: 17px;
+  font-weight: 760;
+}
+
+#clockView .primary-actions,
+#clockView .primary-actions.with-switch {
+  grid-template-columns: 1fr;
+  gap: 12px;
+  margin-top: 0;
+}
+
+#clockView .primary-button,
+#clockView .secondary-button {
+  min-height: 66px;
+  font-size: 17px;
+  letter-spacing: 0;
+}
+
+#clockView .absence-button {
+  margin-top: 0;
+}
+
 .status-topline,
 .section-heading,
 .team-head {

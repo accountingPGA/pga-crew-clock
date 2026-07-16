@@ -1,4 +1,4 @@
-const CACHE_NAME = "pga-crew-clock-v6";
+const CACHE_NAME = "pga-crew-clock-v7";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -6,6 +6,11 @@ const APP_SHELL = [
   "./app.js",
   "./manifest.webmanifest",
   "./assets/PINNACLE.png",
+  "./assets/app-icon-32-v2.png",
+  "./assets/app-icon-180-v2.png",
+  "./assets/app-icon-192-v2.png",
+  "./assets/app-icon-512-v2.png",
+  "./assets/app-icon-maskable-512-v2.png",
 ];
 
 self.addEventListener("install", (event) => {
@@ -53,8 +58,8 @@ self.addEventListener("push", (event) => {
       body,
       tag,
       renotify: false,
-      icon: "./assets/PINNACLE.png",
-      badge: "./assets/PINNACLE.png",
+      icon: "./assets/app-icon-192-v2.png",
+      badge: "./assets/app-icon-192-v2.png",
       data: { url },
     })
   );

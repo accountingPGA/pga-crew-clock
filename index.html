@@ -8,6 +8,8 @@
     <meta name="apple-mobile-web-app-title" content="PGA Crew Clock" />
     <title>PGA Crew Clock</title>
     <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="32x32" href="./assets/app-icon-32-v2.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./assets/app-icon-180-v2.png" />
     <link rel="stylesheet" href="./styles.css" />
     <script>
       window.CREW_CLOCK_CONFIG = {
@@ -71,7 +73,7 @@
         <button class="text-button logout-button" id="logoutButton" type="button">Log Out</button>
       </header>
 
-      <div class="connection-bar" id="connectionBar">
+      <div class="connection-bar" id="connectionBar" hidden>
         <span class="connection-dot" aria-hidden="true"></span>
         <span id="connectionText">Connected to Payroll 2.0</span>
       </div>
@@ -93,7 +95,7 @@
 
           <div class="shift-controls" aria-label="Shift options">
             <label>
-              Jobsite
+              Select Jobsite
               <span class="select-with-swatch">
                 <span class="site-swatch" id="siteSwatch" aria-hidden="true"></span>
                 <select id="siteSelect"></select>
@@ -119,7 +121,7 @@
               Switch Jobsite
             </button>
           </div>
-          <button class="secondary-button absence-button" id="absentButton" type="button" hidden>Mark Absent Today</button>
+          <button class="secondary-button absence-button" id="absentButton" type="button" hidden>MARK ABSENT</button>
         </section>
 
         <section class="reminder-panel" id="reminderPanel" aria-label="Clock reminders" hidden>
@@ -245,17 +247,8 @@
     </div>
 
     <div class="modal-backdrop" id="absentDialog" hidden>
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="absentTitle" aria-describedby="absentText">
-        <div class="modal-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24">
-            <path d="M8 7h8" />
-            <path d="M6 11h12" />
-            <path d="M10 15h4" />
-            <rect x="5" y="4" width="14" height="16" rx="2" />
-          </svg>
-        </div>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="absentTitle">
         <h2 id="absentTitle">Mark yourself absent for today?</h2>
-        <p id="absentText">This stops today’s reminders and does not create payroll hours.</p>
         <div class="modal-actions">
           <button class="secondary-button" id="absentNoButton" type="button">No</button>
           <button class="primary-button" id="absentYesButton" type="button">Yes</button>
@@ -267,6 +260,6 @@
 
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
-    <script src="./app.js?v=20260715-fcm-diagnostics"></script>
+    <script src="./app.js?v=20260715-clock-ui"></script>
   </body>
 </html>

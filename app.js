@@ -974,6 +974,7 @@ function renderShell() {
     const key = view.id.replace("View", "");
     view.classList.toggle("active", key === state.activeTab || (!manager && key === "clock"));
   });
+  els.connectionBar.hidden = !manager || state.activeTab === "clock";
 }
 
 function renderAlertsTabIndicator() {
@@ -1007,44 +1008,41 @@ function renderClock() {
   els.switchButton.disabled = !canClock;
   els.siteSelect.disabled = !!current || !canClock || absent;
   els.absentButton.hidden = !canMarkAbsent;
-  els.absentButton.textContent = absent ? "Undo Absence" : "Mark Absent Today";
+  els.absentButton.textContent = absent ? "UNDO ABSENCE" : "MARK ABSENT";
   renderReminderPanel();
+  const problem = clockStatusProblem(canClock);
+  els.statusPanel.classList.toggle("clocked-in", !!current);
+  els.statusPanel.classList.toggle("clocked-out", !current);
+  els.statusPanel.classList.toggle("status-problem", !!problem);
+  els.clockTitle.textContent = currentWorker();
+  els.statusPill.textContent = problem ? "🔴 Please Contact Admin (Gwyneth)" : "🟢 Ready for Clock In";
+  els.statusPill.className = `status-pill ${problem ? "problem" : "ready"}`;
 
   if (!apiReady()) {
-    els.statusPill.textContent = "Setup needed";
-    els.statusPill.className = "status-pill out";
-    els.clockTitle.textContent = "Add Web App URL";
-    els.statusDetail.textContent = "Deploy the backend and paste the URL in index.html.";
+    els.statusDetail.textContent = "";
   } else if (!payroll.jobsites.length) {
-    els.statusPill.textContent = "No jobsites";
-    els.statusPill.className = "status-pill out";
-    els.clockTitle.textContent = "Waiting for jobsites";
-    els.statusDetail.textContent = "Add Active jobsites in Payroll 2.0.";
+    els.statusDetail.textContent = "";
   } else if (absent) {
-    els.statusPill.textContent = "Absent";
-    els.statusPill.className = "status-pill out";
-    els.clockTitle.textContent = "Absent Today";
-    els.statusDetail.textContent = "No payroll hours created.";
+    if (!problem) {
+      els.statusPill.textContent = "🟢 Absent Today";
+      els.statusPill.className = "status-pill ready";
+    }
+    els.statusDetail.textContent = "";
     els.clockButton.className = "primary-button";
-    els.clockButton.innerHTML = clockIcon() + " Clock In";
+    els.clockButton.textContent = "CLOCK IN";
     els.switchButton.hidden = true;
     els.primaryActions.classList.remove("with-switch");
   } else if (current) {
-    els.statusPill.textContent = "Clocked in";
-    els.statusPill.className = "status-pill";
-    els.clockTitle.textContent = shiftDurationLabel(current);
     els.statusDetail.textContent = current.jobsite;
     els.clockButton.className = "primary-button stop";
-    els.clockButton.innerHTML = clockIcon() + " Clock Out";
+    els.clockButton.textContent = "END SHIFT";
     els.switchButton.hidden = false;
+    els.switchButton.textContent = "SWITCH JOBSITE";
     els.primaryActions.classList.add("with-switch");
   } else {
-    els.statusPill.textContent = "Clocked out";
-    els.statusPill.className = "status-pill out";
-    els.clockTitle.textContent = "Ready for jobsite";
-    els.statusDetail.textContent = state.selectedJobsite || "Select jobsite";
+    els.statusDetail.textContent = "";
     els.clockButton.className = "primary-button";
-    els.clockButton.innerHTML = clockIcon() + " Clock In";
+    els.clockButton.textContent = "CLOCK IN";
     els.switchButton.hidden = true;
     els.primaryActions.classList.remove("with-switch");
   }
@@ -1054,6 +1052,12 @@ function renderClock() {
   els.rowCount.textContent = String(rows.length);
   els.entryCount.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
   renderCompletedRows(rows);
+}
+
+function clockStatusProblem(canClock) {
+  if (!apiReady()) return true;
+  if (!canClock) return true;
+  return els.connectionBar.classList.contains("error");
 }
 
 function renderCompletedRows(rows) {
