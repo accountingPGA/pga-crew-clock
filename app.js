@@ -510,7 +510,7 @@ function setLocalAbsence(isAbsent) {
 async function toggleClock() {
   if (!state.auth) return;
   if (!payroll.jobsites.length) return showToast("No active jobsites in Payroll 2.0");
-  if (isAbsentToday()) return showToast("Undo absence before clocking in");
+  if (isAbsentToday()) return showToast("You have been marked absent for today.");
   const current = currentActiveShift();
   if (current) {
     openLunchDialog("clockOut", current.id);
@@ -621,7 +621,7 @@ function closeSwitchDialog() {
 
 function handleAbsentButton() {
   if (isAbsentToday()) {
-    undoAbsenceToday();
+    showToast("Absent Today");
     return;
   }
   els.absentDialog.hidden = false;
@@ -653,29 +653,6 @@ async function markAbsentToday() {
     saveState();
     setConnection("error", error.message);
     showToast("Could not save absence");
-  } finally {
-    render();
-  }
-}
-
-async function undoAbsenceToday() {
-  setLocalAbsence(false);
-  saveState();
-  render();
-  setConnection("loading", "Undoing absence");
-  try {
-    await apiPost("undoAbsence", {
-      token: state.auth?.token,
-      date: todayKey(),
-    });
-    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === currentWorker() && entry.date === todayKey()));
-    setConnection("ready", "Absence removed");
-    showToast("Absence removed");
-  } catch (error) {
-    setLocalAbsence(true);
-    saveState();
-    setConnection("error", error.message);
-    showToast("Could not undo absence");
   } finally {
     render();
   }
@@ -995,7 +972,7 @@ function renderClock() {
   const site = findJobsite(current?.jobsite || state.selectedJobsite);
   const canClock = payroll.jobsites.length > 0;
   const absent = isAbsentToday();
-  const canMarkAbsent = absent || !hasClockedInToday();
+  const canShowAbsentAction = !current && !absent && !hasClockedInToday();
 
   els.liveClock.textContent = new Intl.DateTimeFormat([], {
     hour: "numeric",
@@ -1007,8 +984,8 @@ function renderClock() {
   els.clockButton.disabled = !canClock || absent;
   els.switchButton.disabled = !canClock;
   els.siteSelect.disabled = !!current || !canClock || absent;
-  els.absentButton.hidden = !canMarkAbsent;
-  els.absentButton.textContent = absent ? "UNDO ABSENCE" : "MARK ABSENT";
+  els.absentButton.hidden = !canShowAbsentAction;
+  els.absentButton.textContent = "MARK ABSENT";
   renderReminderPanel();
   const problem = clockStatusProblem(canClock);
   els.statusPanel.classList.toggle("clocked-in", !!current);
