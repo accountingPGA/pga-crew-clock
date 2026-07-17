@@ -347,8 +347,11 @@ h2 {
 
 #clockView .status-panel h2 {
   margin-top: 0;
-  font-size: 30px;
-  line-height: 1.05;
+  color: var(--ink);
+  font-size: 22px;
+  font-weight: 840;
+  line-height: 1.15;
+  text-transform: uppercase;
 }
 
 #clockView .status-topline {
@@ -386,13 +389,20 @@ h2 {
   display: none;
 }
 
-#clockView .status-panel.clocked-in .status-detail {
-  display: block;
-  margin-top: 0;
-  color: var(--ink);
+#clockView .status-panel.clocked-in h2 {
   font-size: 30px;
-  font-weight: 840;
   line-height: 1.05;
+  text-transform: none;
+}
+
+#clockView .status-panel.clocked-in .status-detail {
+  display: none;
+}
+
+#clockView .status-detail {
+  margin-top: -10px;
+  font-size: 16px;
+  line-height: 1.35;
 }
 
 #clockView .shift-controls {
@@ -413,7 +423,7 @@ h2 {
 #clockView .primary-actions.with-switch {
   grid-template-columns: 1fr;
   gap: 12px;
-  margin-top: 0;
+  margin-top: 2px;
 }
 
 #clockView .primary-button,
@@ -428,9 +438,36 @@ h2 {
 }
 
 #clockView .notification-button {
-  min-height: 48px;
-  margin-top: -4px;
-  font-size: 15px;
+  width: 100%;
+  margin-top: 0;
+  background: var(--surface);
+  font-size: 17px;
+}
+
+#clockView .jobsite-helper {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: -2px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+#clockView .jobsite-helper::before {
+  content: "i";
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 820;
+  line-height: 1;
 }
 
 .status-topline,

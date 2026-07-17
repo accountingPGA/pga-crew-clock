@@ -38,6 +38,7 @@ const els = {
   statusPill: document.querySelector("#statusPill"),
   clockTitle: document.querySelector("#clockTitle"),
   statusDetail: document.querySelector("#statusDetail"),
+  jobsiteHelper: document.querySelector("#jobsiteHelper"),
   primaryActions: document.querySelector("#primaryActions"),
   clockButton: document.querySelector("#clockButton"),
   switchButton: document.querySelector("#switchButton"),
@@ -114,7 +115,11 @@ function loadState() {
   try {
     const parsed = JSON.parse(saved);
     if (parsed.day === todayKey()) {
-      return { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedTransfers: parsed.expandedTransfers || {} };
+      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedTransfers: parsed.expandedTransfers || {} };
+      if (!hydrated.auth?.worker || !hydrated.activeShifts?.[hydrated.auth.worker]) {
+        hydrated.selectedJobsite = "";
+      }
+      return hydrated;
     }
   } catch {
     localStorage.removeItem(STORAGE_KEY);
@@ -294,8 +299,8 @@ async function loadBootstrap(options = {}) {
     if (employee && state.auth) {
       state.auth.attendanceRequired = employee.attendanceRequired || state.auth.attendanceRequired || "No";
     }
-    if (!payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
-      state.selectedJobsite = payroll.jobsites[0]?.jobsite || "";
+    if (state.selectedJobsite && !payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
+      state.selectedJobsite = "";
     }
     restoreCurrentOpenShift();
     state.lastSync = "Ready";
@@ -519,10 +524,13 @@ async function toggleClock() {
     return;
   }
 
+  const selectedJobsite = findJobsite(state.selectedJobsite);
+  if (!selectedJobsite) return showToast("Select a jobsite before clocking in.");
+
   const nextShift = {
     id: newId(),
     worker: currentWorker(),
-    jobsite: state.selectedJobsite || payroll.jobsites[0].jobsite,
+    jobsite: selectedJobsite.jobsite,
     start: new Date().toISOString(),
   };
   setConnection("loading", "Opening shift");
@@ -572,6 +580,7 @@ async function finishClockOut(lunch) {
     syncStatus: "pending",
   };
   delete state.activeShifts[currentWorker()];
+  state.selectedJobsite = "";
   state.shifts.unshift(completed);
   state.lastSync = "Saving";
   saveState();
@@ -638,6 +647,7 @@ async function markAbsentToday() {
   closeAbsentDialog();
   if (hasClockedInToday()) return showToast("You already clocked in today");
   setLocalAbsence(true);
+  state.selectedJobsite = "";
   saveState();
   render();
   setConnection("loading", "Saving absence");
@@ -967,11 +977,12 @@ function renderAlertsTabIndicator() {
 }
 
 function renderClock() {
-  renderJobsiteSelect(els.siteSelect, state.selectedJobsite);
+  renderJobsiteSelect(els.siteSelect, state.selectedJobsite, { placeholder: true });
   const current = currentActiveShift();
   const rows = completedRowsFor();
   const lastRow = rows[0];
   const site = findJobsite(current?.jobsite || state.selectedJobsite);
+  const selectedJobsite = findJobsite(state.selectedJobsite);
   const canClock = payroll.jobsites.length > 0;
   const absent = isAbsentToday();
   const clockDataReady = !bootstrapLoading && !!payroll.loadedAt;
@@ -985,8 +996,10 @@ function renderClock() {
     timeZone: APP_TIME_ZONE,
   }).format(new Date());
   els.statusPanel.style.setProperty("--site-color", site?.colour || "#007f73");
-  els.siteSwatch.style.background = site?.colour || "#007f73";
-  els.clockButton.disabled = !connectionReady || !canClock || absent;
+  els.siteSwatch.style.background = selectedJobsite?.colour || "#8a94a6";
+  els.clockButton.disabled = current
+    ? !connectionReady || !canClock || absent
+    : !connectionReady || !canClock || absent || !selectedJobsite;
   els.switchButton.disabled = !connectionReady || !canClock;
   const siteSelectDisabled = !connectionReady || !!current || !canClock || absent;
   if (document.activeElement !== els.siteSelect && els.siteSelect.disabled !== siteSelectDisabled) {
@@ -994,34 +1007,35 @@ function renderClock() {
   }
   els.absentButton.hidden = !connectionReady || !clockDataReady || !canShowAbsentAction;
   els.absentButton.textContent = "MARK ABSENT";
+  els.jobsiteHelper.hidden = !!current || absent || !canClock || !!selectedJobsite;
   renderReminderPanel();
   const problem = connectionStatus.state === "offline";
   els.statusPanel.classList.toggle("clocked-in", !!current);
   els.statusPanel.classList.toggle("clocked-out", !current);
   els.statusPanel.classList.toggle("status-problem", !!problem);
-  els.clockTitle.textContent = currentWorker();
+  els.clockTitle.textContent = current ? current.jobsite : "SELECT JOBSITE";
   els.statusPill.textContent = connectionStatus.text;
   els.statusPill.className = `status-pill ${connectionStatus.className}`;
 
   if (!apiReady()) {
-    els.statusDetail.textContent = "";
+    els.statusDetail.textContent = current ? "" : "Where are you working today?";
   } else if (!payroll.jobsites.length) {
-    els.statusDetail.textContent = "";
+    els.statusDetail.textContent = current ? "" : "Where are you working today?";
   } else if (absent) {
-    els.statusDetail.textContent = "";
+    els.statusDetail.textContent = "You have been marked absent for today.";
     els.clockButton.className = "primary-button";
     els.clockButton.textContent = "CLOCK IN";
     els.switchButton.hidden = true;
     els.primaryActions.classList.remove("with-switch");
   } else if (current) {
-    els.statusDetail.textContent = current.jobsite;
+    els.statusDetail.textContent = "";
     els.clockButton.className = "primary-button stop";
     els.clockButton.textContent = "END SHIFT";
     els.switchButton.hidden = false;
     els.switchButton.textContent = "SWITCH JOBSITE";
     els.primaryActions.classList.add("with-switch");
   } else {
-    els.statusDetail.textContent = "";
+    els.statusDetail.textContent = "Where are you working today?";
     els.clockButton.className = "primary-button";
     els.clockButton.textContent = "CLOCK IN";
     els.switchButton.hidden = true;
@@ -1466,13 +1480,20 @@ function renderAlertPerson(person) {
   `;
 }
 
-function renderJobsiteSelect(select, selectedValue) {
-  const options = payroll.jobsites.map((jobsite) => {
+function renderJobsiteSelect(select, selectedValue, options = {}) {
+  const includePlaceholder = !!options.placeholder;
+  const placeholder = `<option value="">Select a jobsite...</option>`;
+  const selectOptions = payroll.jobsites.map((jobsite) => {
     return `<option value="${escapeHtml(jobsite.jobsite)}">${escapeHtml(jobsite.jobsite)}</option>`;
   });
-  const optionsHtml = options.length ? options.join("") : `<option value="">No active jobsites</option>`;
-  const optionsSignature = JSON.stringify(payroll.jobsites.map((jobsite) => jobsite.jobsite));
-  const desiredValue = selectedValue || payroll.jobsites[0]?.jobsite || "";
+  const optionsHtml = selectOptions.length
+    ? `${includePlaceholder ? placeholder : ""}${selectOptions.join("")}`
+    : `<option value="">No active jobsites</option>`;
+  const optionsSignature = JSON.stringify({
+    placeholder: includePlaceholder,
+    jobsites: payroll.jobsites.map((jobsite) => jobsite.jobsite),
+  });
+  const desiredValue = payroll.jobsites.some((jobsite) => jobsite.jobsite === selectedValue) ? selectedValue : "";
 
   if (document.activeElement === select) {
     return;
