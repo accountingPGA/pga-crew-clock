@@ -963,7 +963,7 @@ function renderShell() {
     const key = view.id.replace("View", "");
     view.classList.toggle("active", key === state.activeTab || (!manager && key === "clock"));
   });
-  els.connectionBar.hidden = !manager || state.activeTab === "clock";
+  els.connectionBar.hidden = false;
 }
 
 function renderAlertsTabIndicator() {
@@ -1602,7 +1602,14 @@ function findJobsite(name) {
 
 function setConnection(mode, message) {
   els.connectionBar.className = `connection-bar ${mode === "ready" ? "ready" : mode === "error" ? "error" : ""}`;
-  els.connectionText.textContent = message;
+  const statusText = mode === "ready"
+    ? "Connected to Payroll 2.0"
+    : mode === "error"
+      ? "Lost connection to Payroll 2.0"
+      : "Connecting to Payroll 2.0";
+  els.connectionText.textContent = statusText;
+  els.connectionBar.dataset.detail = message || "";
+  els.connectionBar.setAttribute("aria-label", message ? `${statusText}: ${message}` : statusText);
 }
 
 function setLoginMessage(message, isError = false) {
