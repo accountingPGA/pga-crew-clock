@@ -101,6 +101,7 @@ function defaultState() {
     activeShifts: {},
     shifts: [],
     absenceDate: "",
+    expandedAlertSections: {},
     expandedTransfers: {},
     notificationEndpoint: "",
     reminderStatus: "",
@@ -115,7 +116,7 @@ function loadState() {
   try {
     const parsed = JSON.parse(saved);
     if (parsed.day === todayKey()) {
-      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedTransfers: parsed.expandedTransfers || {} };
+      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedAlertSections: parsed.expandedAlertSections || {}, expandedTransfers: parsed.expandedTransfers || {} };
       if (!hydrated.auth?.worker || !hydrated.activeShifts?.[hydrated.auth.worker]) {
         hydrated.selectedJobsite = "";
       }
@@ -972,8 +973,11 @@ function renderAlertsTabIndicator() {
     els.alertsTab.textContent = "Alerts";
     return;
   }
-  const count = alertItemCount(buildAlertSections());
-  els.alertsTab.textContent = count ? `Alerts 🔴 ${count}` : "Alerts";
+  const hasActionableAlerts = alertItemCount(buildAlertSections().filter((section) => section.actionable)) > 0;
+  els.alertsTab.innerHTML = hasActionableAlerts
+    ? `Alerts <span class="tab-alert-badge" aria-hidden="true">!</span>`
+    : "Alerts";
+  els.alertsTab.setAttribute("aria-label", hasActionableAlerts ? "Alerts, actionable items" : "Alerts");
 }
 
 function renderClock() {
@@ -1371,13 +1375,8 @@ function keyForCompare(value) {
 }
 
 function renderAlerts() {
-  const sections = buildAlertSections().filter((section) => section.people.length);
-  if (!sections.length) {
-    els.alertsList.innerHTML = `<p class="empty-state">✓ Everyone is accounted for today.</p>`;
-    return;
-  }
-
-  els.alertsList.innerHTML = sections.map(renderAlertSection).join("");
+  els.alertsList.innerHTML = buildAlertGroups().map(renderAlertGroup).join("");
+  bindAlertSectionState();
 }
 
 function buildAlertSections() {
@@ -1401,9 +1400,13 @@ function buildAlertSections() {
       });
     });
 
+  const switchedPeople = switchedJobsitePeople();
+
   return [
     {
-      title: "🔴 Not Clocked In",
+      key: "notClockedIn",
+      title: "Not Clocked In",
+      actionable: true,
       people: activeAttendanceEmployees()
         .filter((employee) => !hasAttendanceClockInToday(employee.worker) && !absentWorkers.has(employee.worker))
         .map((employee) => ({
@@ -1414,21 +1417,15 @@ function buildAlertSections() {
         .sort(compareAlertPeople),
     },
     {
-      title: "🟢 Absent Today",
-      people: [...absentWorkers]
-        .map((worker) => ({
-          worker,
-          status: "Absent",
-          statusClass: "absent",
-        }))
-        .sort(compareAlertPeople),
-    },
-    {
-      title: "🔴 Still Clocked In (after the final reminder time only)",
+      key: "stillClockedIn",
+      title: "Still Clocked In",
+      actionable: true,
       people: isAfterStillClockedInAlertTime() ? [...activeMap.values()].sort(compareAlertPeople) : [],
     },
     {
-      title: "🔴 Save Problems",
+      key: "saveProblems",
+      title: "Save Problems",
+      actionable: true,
       people: failed.concat(pending)
         .map((shift) => ({
           worker: shift.worker,
@@ -1438,7 +1435,69 @@ function buildAlertSections() {
         }))
         .sort(compareAlertPeople),
     },
+    {
+      key: "switchedJobsite",
+      title: "Switched Jobsite",
+      actionable: false,
+      people: switchedPeople,
+    },
+    {
+      key: "absentToday",
+      title: "Absent Today",
+      actionable: false,
+      people: [...absentWorkers]
+        .map((worker) => ({
+          worker,
+          status: "Absent",
+          statusClass: "absent",
+        }))
+        .sort(compareAlertPeople),
+    },
   ];
+}
+
+function buildAlertGroups() {
+  const sections = buildAlertSections();
+  const byKey = new Map(sections.map((section) => [section.key, section]));
+  return [
+    {
+      title: "Needs Attention",
+      sections: ["notClockedIn", "stillClockedIn", "saveProblems"].map((key) => byKey.get(key)),
+    },
+    {
+      title: "Today's Activity",
+      sections: ["switchedJobsite", "absentToday"].map((key) => byKey.get(key)),
+    },
+  ];
+}
+
+function switchedJobsitePeople() {
+  return payroll.employees
+    .map((employee) => {
+      const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
+      const active = state.activeShifts[employee.worker] || (stateRow?.status === "Clocked In" ? {
+        worker: employee.worker,
+        jobsite: stateRow.jobsite,
+        start: stateRow.clockInAt,
+      } : null);
+      const transferHistory = transferHistoryFor(employee.worker, active || null);
+      if (!transferHistory.length) return null;
+      const latest = transferHistory[transferHistory.length - 1];
+      return {
+        worker: employee.worker,
+        status: "Switched",
+        statusClass: "",
+        jobsite: latest.currentJobsite,
+        detail: `${latest.previousJobsite} → ${latest.currentJobsite}`,
+        clockIn: latest.transferTime,
+        details: transferHistory.map((transfer) => ({
+          time: transfer.transferTime,
+          text: `${transfer.previousJobsite} → ${transfer.currentJobsite}`,
+        })),
+      };
+    })
+    .filter(Boolean)
+    .sort(compareAlertPeople);
 }
 
 function alertItemCount(sections) {
@@ -1449,18 +1508,52 @@ function compareAlertPeople(a, b) {
   return a.worker.localeCompare(b.worker);
 }
 
-function renderAlertSection(section) {
+function renderAlertGroup(group) {
   return `
-    <section class="alert-section">
-      <header class="alert-section-header">
-        <strong>${escapeHtml(section.title)}</strong>
-        <span>${section.people.length}</span>
-      </header>
-      <div class="alert-people">
-        ${section.people.map(renderAlertPerson).join("")}
+    <section class="alert-group">
+      <h3>${escapeHtml(group.title)}</h3>
+      <div class="alert-group-sections">
+        ${group.sections.filter(Boolean).map(renderAlertSection).join("")}
       </div>
     </section>
   `;
+}
+
+function renderAlertSection(section) {
+  const open = isAlertSectionExpanded(section.key) ? " open" : "";
+  const empty = section.people.length ? "" : " empty";
+  return `
+    <details class="alert-section${empty}" data-alert-section="${escapeAttribute(section.key)}"${open}>
+      <summary class="alert-section-header">
+        <span class="alert-chevron" aria-hidden="true"></span>
+        <strong>${escapeHtml(section.title)}</strong>
+        <span class="alert-count">${section.people.length}</span>
+      </summary>
+      <div class="alert-people">
+        ${section.people.length ? section.people.map(renderAlertPerson).join("") : `<p class="empty-state">No items right now.</p>`}
+      </div>
+    </details>
+  `;
+}
+
+function bindAlertSectionState() {
+  if (!state.expandedAlertSections) state.expandedAlertSections = {};
+  els.alertsList.querySelectorAll(".alert-section").forEach((section) => {
+    section.addEventListener("toggle", () => {
+      const key = section.dataset.alertSection || "";
+      if (!key) return;
+      if (section.open) {
+        state.expandedAlertSections[key] = true;
+      } else {
+        delete state.expandedAlertSections[key];
+      }
+      saveState();
+    });
+  });
+}
+
+function isAlertSectionExpanded(key) {
+  return !!state.expandedAlertSections?.[key];
 }
 
 function renderAlertPerson(person) {
@@ -1473,6 +1566,7 @@ function renderAlertPerson(person) {
           ${person.jobsite ? `<span class="person-sub">${escapeHtml(person.jobsite)}</span>` : ""}
           ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
           ${person.detail ? `<span class="person-sub">${escapeHtml(person.detail)}</span>` : ""}
+          ${person.details ? person.details.map((detail) => `<span class="person-sub">${detail.time ? `${timeLabel(detail.time)} ` : ""}${escapeHtml(detail.text)}</span>`).join("") : ""}
         </div>
         <span class="mini-pill ${person.statusClass || ""}">${escapeHtml(person.status)}</span>
       </div>

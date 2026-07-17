@@ -296,6 +296,7 @@ h2 {
   min-height: 44px;
   align-items: center;
   justify-content: center;
+  gap: 7px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
@@ -307,6 +308,19 @@ h2 {
   border-color: var(--teal);
   background: var(--surface-alt);
   color: var(--teal-dark);
+}
+
+.tab-alert-badge {
+  display: inline-grid;
+  min-width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1;
 }
 
 .view {
@@ -747,6 +761,10 @@ textarea {
   gap: 12px;
 }
 
+.alerts-list {
+  gap: 16px;
+}
+
 .jobsite-group {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -920,6 +938,25 @@ textarea {
   white-space: nowrap;
 }
 
+.alert-group {
+  display: grid;
+  gap: 10px;
+}
+
+.alert-group h3 {
+  margin: 4px 2px 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 860;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.alert-group-sections {
+  display: grid;
+  gap: 10px;
+}
+
 .alert-section {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -927,18 +964,28 @@ textarea {
   background: var(--surface);
 }
 
-.alert-section + .alert-section {
-  margin-top: 12px;
+.alert-section.empty {
+  background: #fbfcfd;
+  opacity: 0.78;
 }
 
 .alert-section-header {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
+  cursor: pointer;
+  list-style: none;
   padding: 12px;
-  border-bottom: 1px solid var(--line);
   background: var(--surface-alt);
+}
+
+.alert-section[open] .alert-section-header {
+  border-bottom: 1px solid var(--line);
+}
+
+.alert-section-header::-webkit-details-marker {
+  display: none;
 }
 
 .alert-section-header strong {
@@ -949,10 +996,27 @@ textarea {
   white-space: nowrap;
 }
 
-.alert-section-header span {
+.alert-section.empty .alert-section-header strong {
+  color: var(--muted);
+}
+
+.alert-count {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
+}
+
+.alert-chevron {
+  width: 9px;
+  height: 9px;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.16s ease;
+}
+
+.alert-section[open] .alert-chevron {
+  transform: rotate(45deg);
 }
 
 .alert-people {
