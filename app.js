@@ -1132,7 +1132,7 @@ function renderOperations() {
   if (isAbsentToday()) absentWorkers.add(currentWorker());
   const clockedOutWorkers = new Set(completed.map((shift) => shift.worker));
   todayStates.filter((entry) => entry.status === "Clocked Out").forEach((entry) => clockedOutWorkers.add(entry.worker));
-  const totalHours = summarize(completed.concat(activeEntries)).workMs;
+  const totalHours = summarize(operationsHourSegments()).workMs;
 
   els.clockedInCount.textContent = String(clockedInWorkers.size);
   els.clockedOutCount.textContent = String([...clockedOutWorkers].filter((worker) => !clockedInWorkers.has(worker) && !absentWorkers.has(worker)).length);
@@ -1143,6 +1143,55 @@ function renderOperations() {
     ? groups.map(renderOperationsGroup).join("")
     : `<p class="empty-state">No clocked-in, clocked-out, or absent employees today</p>`;
   bindTransferExpansionState();
+}
+
+function operationsHourSegments() {
+  const segments = [];
+  payroll.submissions
+    .filter((row) => row.date === todayKey())
+    .forEach((row) => {
+      segments.push({
+        sourceId: row.submissionId || "",
+        worker: row.worker,
+        jobsite: row.jobsite,
+        start: row.clockInAt,
+        end: row.clockOutAt,
+      });
+    });
+  state.shifts
+    .filter((shift) => localDateKey(new Date(shift.start)) === todayKey())
+    .forEach((shift) => {
+      segments.push({
+        sourceId: shift.id,
+        worker: shift.worker,
+        jobsite: shift.jobsite,
+        start: shift.start,
+        end: shift.end,
+      });
+    });
+  payroll.clockStates
+    .filter((entry) => entry.date === todayKey() && entry.status === "Clocked In")
+    .forEach((entry) => {
+      segments.push({
+        sourceId: entry.sessionId || "",
+        worker: entry.worker,
+        jobsite: entry.jobsite,
+        start: entry.clockInAt,
+        end: "",
+      });
+    });
+  Object.values(state.activeShifts)
+    .filter((shift) => localDateKey(new Date(shift.start)) === todayKey())
+    .forEach((shift) => {
+      segments.push({
+        sourceId: shift.id,
+        worker: shift.worker,
+        jobsite: shift.jobsite,
+        start: shift.start,
+        end: "",
+      });
+    });
+  return dedupeSegments(segments);
 }
 
 function buildOperationsGroups(absentWorkers) {
