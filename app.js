@@ -1375,8 +1375,24 @@ function keyForCompare(value) {
 }
 
 function renderAlerts() {
-  els.alertsList.innerHTML = buildAlertGroups().map(renderAlertGroup).join("");
+  const groups = buildAlertGroups();
+  const signature = alertGroupsSignature(groups);
+  if (els.alertsList.dataset.alertSignature === signature) return;
+  els.alertsList.innerHTML = groups.map(renderAlertGroup).join("");
+  els.alertsList.dataset.alertSignature = signature;
   bindAlertSectionState();
+}
+
+function alertGroupsSignature(groups) {
+  return JSON.stringify(groups.map((group) => ({
+    title: group.title,
+    sections: group.sections.filter(Boolean).map((section) => ({
+      key: section.key,
+      title: section.title,
+      actionable: !!section.actionable,
+      people: section.people,
+    })),
+  })));
 }
 
 function buildAlertSections() {
