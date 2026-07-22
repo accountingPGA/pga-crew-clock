@@ -123,6 +123,7 @@
             </button>
           </div>
           <button class="secondary-button absence-button" id="absentButton" type="button" hidden>MARK ABSENT</button>
+          <button class="secondary-button absence-button" id="markEmployeeAbsentButton" type="button" hidden>MARK EMPLOYEE ABSENT</button>
           <button class="secondary-button notification-button" id="notificationButton" type="button" hidden>🔔 ENABLE NOTIFICATIONS</button>
         </section>
 
@@ -254,6 +255,39 @@
         <div class="modal-actions">
           <button class="secondary-button" id="absentNoButton" type="button">No</button>
           <button class="primary-button" id="absentYesButton" type="button">Yes</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="employeeAbsentDialog" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="employeeAbsentTitle">
+        <h2 id="employeeAbsentTitle">Mark Employee Absent</h2>
+        <label class="modal-field">
+          Employee
+          <select id="employeeAbsentSelect"></select>
+        </label>
+        <label class="modal-field">
+          Reason
+          <select id="employeeAbsentReason">
+            <option value="">Select reason...</option>
+            <option value="Sick">Sick</option>
+            <option value="Approved Leave">Approved Leave</option>
+            <option value="No Show">No Show</option>
+          </select>
+        </label>
+        <div class="modal-actions">
+          <button class="secondary-button" id="employeeAbsentCancelButton" type="button">Cancel</button>
+          <button class="primary-button" id="employeeAbsentSubmitButton" type="button">Submit</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="removeAbsenceDialog" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="removeAbsenceTitle">
+        <h2 id="removeAbsenceTitle">Remove today's absence?</h2>
+        <div class="modal-actions">
+          <button class="secondary-button" id="removeAbsenceCancelButton" type="button">Cancel</button>
+          <button class="primary-button danger-button" id="removeAbsenceConfirmButton" type="button">Remove</button>
         </div>
       </section>
     </div>

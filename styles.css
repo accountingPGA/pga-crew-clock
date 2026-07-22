@@ -539,6 +539,18 @@ h2 {
   color: var(--danger);
 }
 
+.absence-remove-button {
+  border: 0;
+  background: #fef3f2;
+  color: var(--danger);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.absence-remove-button:active {
+  transform: translateY(1px);
+}
+
 .mini-pill.out {
   background: #f3f4f6;
   color: #475467;
@@ -1188,6 +1200,10 @@ textarea {
   grid-template-columns: 1fr 1fr;
   gap: 10px;
   margin-top: 16px;
+}
+
+.danger-button {
+  background: var(--danger);
 }
 
 @media (min-width: 820px) {

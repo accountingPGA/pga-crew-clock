@@ -43,6 +43,7 @@ const els = {
   clockButton: document.querySelector("#clockButton"),
   switchButton: document.querySelector("#switchButton"),
   absentButton: document.querySelector("#absentButton"),
+  markEmployeeAbsentButton: document.querySelector("#markEmployeeAbsentButton"),
   notificationButton: document.querySelector("#notificationButton"),
   reminderPanel: document.querySelector("#reminderPanel"),
   enableRemindersButton: document.querySelector("#enableRemindersButton"),
@@ -68,6 +69,15 @@ const els = {
   absentDialog: document.querySelector("#absentDialog"),
   absentYesButton: document.querySelector("#absentYesButton"),
   absentNoButton: document.querySelector("#absentNoButton"),
+  employeeAbsentDialog: document.querySelector("#employeeAbsentDialog"),
+  employeeAbsentSelect: document.querySelector("#employeeAbsentSelect"),
+  employeeAbsentReason: document.querySelector("#employeeAbsentReason"),
+  employeeAbsentSubmitButton: document.querySelector("#employeeAbsentSubmitButton"),
+  employeeAbsentCancelButton: document.querySelector("#employeeAbsentCancelButton"),
+  removeAbsenceDialog: document.querySelector("#removeAbsenceDialog"),
+  removeAbsenceTitle: document.querySelector("#removeAbsenceTitle"),
+  removeAbsenceConfirmButton: document.querySelector("#removeAbsenceConfirmButton"),
+  removeAbsenceCancelButton: document.querySelector("#removeAbsenceCancelButton"),
   toast: document.querySelector("#toast"),
 };
 
@@ -86,6 +96,7 @@ let pendingClockOutShiftId = null;
 let lunchDialogMode = "";
 let pendingSwitchShiftId = null;
 let pendingSwitchLunch = "";
+let pendingRemoveAbsenceWorker = "";
 let toastTimer;
 let renderTimer;
 let operationsRefreshTimer;
@@ -195,6 +206,7 @@ function setup() {
   els.clockButton.addEventListener("click", toggleClock);
   els.switchButton.addEventListener("click", openSwitchDialog);
   els.absentButton.addEventListener("click", handleAbsentButton);
+  els.markEmployeeAbsentButton.addEventListener("click", openEmployeeAbsentDialog);
   els.notificationButton.addEventListener("click", enableClockReminders);
   els.enableRemindersButton.addEventListener("click", enableClockReminders);
   els.retryButton.addEventListener("click", retryFailedSaves);
@@ -204,6 +216,13 @@ function setup() {
   els.switchCancelButton.addEventListener("click", closeSwitchDialog);
   els.absentYesButton.addEventListener("click", markAbsentToday);
   els.absentNoButton.addEventListener("click", closeAbsentDialog);
+  els.employeeAbsentSubmitButton.addEventListener("click", submitEmployeeAbsence);
+  els.employeeAbsentCancelButton.addEventListener("click", closeEmployeeAbsentDialog);
+  els.employeeAbsentSelect.addEventListener("change", renderEmployeeAbsentSubmitState);
+  els.employeeAbsentReason.addEventListener("change", renderEmployeeAbsentSubmitState);
+  els.removeAbsenceConfirmButton.addEventListener("click", removeEmployeeAbsence);
+  els.removeAbsenceCancelButton.addEventListener("click", closeRemoveAbsenceDialog);
+  els.teamList.addEventListener("click", handleOperationsClick);
 
   els.tabs.forEach((tab) => {
     tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
@@ -303,6 +322,9 @@ async function loadBootstrap(options = {}) {
     if (state.selectedJobsite && !payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
       state.selectedJobsite = "";
     }
+    if (state.absenceDate === todayKey() && !payroll.absences.some((entry) => entry.worker === currentWorker() && entry.date === todayKey() && entry.status === "Absent")) {
+      state.absenceDate = "";
+    }
     restoreCurrentOpenShift();
     state.lastSync = "Ready";
     saveState();
@@ -369,6 +391,11 @@ function attendanceRequiredFor(worker = currentWorker()) {
 function isManagerMode() {
   const role = currentRole().toLowerCase();
   return ["admin", "manager", "supervisor", "foreman", "lead", "operations", "office"].some((word) => role.includes(word));
+}
+
+function canMarkEmployeeAbsent() {
+  const role = currentRole().toLowerCase();
+  return ["admin", "manager", "foreman"].some((word) => role.includes(word));
 }
 
 function canEnableDeviceNotifications() {
@@ -518,7 +545,7 @@ function setLocalAbsence(isAbsent) {
 async function toggleClock() {
   if (!state.auth) return;
   if (!payroll.jobsites.length) return showToast("No active jobsites in Payroll 2.0");
-  if (isAbsentToday()) return showToast("You have been marked absent for today.");
+  if (isAbsentToday()) return showToast("You have been marked absent for today. Please contact your foreman or the office if this is incorrect.");
   const current = currentActiveShift();
   if (current) {
     openLunchDialog("clockOut", current.id);
@@ -668,6 +695,137 @@ async function markAbsentToday() {
     showToast("Could not save absence");
   } finally {
     render();
+  }
+}
+
+function openEmployeeAbsentDialog() {
+  if (!canMarkEmployeeAbsent()) return;
+  renderEmployeeAbsentOptions();
+  if (els.employeeAbsentSelect.options.length <= 1) {
+    showToast("No active employees available");
+    return;
+  }
+  els.employeeAbsentReason.value = "";
+  renderEmployeeAbsentSubmitState();
+  els.employeeAbsentDialog.hidden = false;
+  els.employeeAbsentSelect.focus();
+}
+
+function closeEmployeeAbsentDialog() {
+  els.employeeAbsentDialog.hidden = true;
+  els.employeeAbsentSubmitButton.disabled = false;
+  els.employeeAbsentSubmitButton.textContent = "Submit";
+}
+
+function renderEmployeeAbsentOptions() {
+  const employees = payroll.employees
+    .filter((employee) => employee.worker && String(employee.status || "Active").toLowerCase() === "active")
+    .filter((employee) => employee.worker !== currentWorker())
+    .sort((a, b) => a.worker.localeCompare(b.worker));
+
+  els.employeeAbsentSelect.innerHTML = [
+    `<option value="">Select employee...</option>`,
+    ...employees.map((employee) => `<option value="${escapeHtml(employee.worker)}">${escapeHtml(employee.worker)}</option>`),
+  ].join("");
+}
+
+function renderEmployeeAbsentSubmitState() {
+  els.employeeAbsentSubmitButton.disabled = !els.employeeAbsentSelect.value || !els.employeeAbsentReason.value;
+}
+
+async function submitEmployeeAbsence() {
+  if (!canMarkEmployeeAbsent()) return;
+  const worker = els.employeeAbsentSelect.value;
+  const reason = els.employeeAbsentReason.value;
+  if (!worker || !reason) {
+    renderEmployeeAbsentSubmitState();
+    return;
+  }
+  if (hasClockedInToday(worker)) return showToast("This employee has already clocked in today.");
+  if (isAbsentToday(worker)) return showToast("This employee is already marked absent today.");
+
+  els.employeeAbsentSubmitButton.disabled = true;
+  els.employeeAbsentSubmitButton.textContent = "Saving";
+  setConnection("loading", "Saving absence");
+  try {
+    const data = await apiPost("markEmployeeAbsent", {
+      token: state.auth?.token,
+      date: todayKey(),
+      worker,
+      reason,
+    });
+    const absence = data.absence || { worker, date: todayKey(), status: "Absent", reason, submittedBy: currentWorker() };
+    payroll.absences = payroll.absences.filter((entry) => !(entry.worker === worker && entry.date === todayKey()));
+    payroll.absences.push(absence);
+    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === worker && entry.date === todayKey()));
+    payroll.clockStates.push({ worker, date: todayKey(), status: "Absent", jobsite: "", clockInAt: "", clockOutAt: "" });
+    setConnection("ready", "Absent Today saved");
+    showToast(`✓ ${worker} marked absent (${reason}).`);
+    window.setTimeout(() => {
+      closeEmployeeAbsentDialog();
+      state.activeTab = "clock";
+      saveState();
+      render();
+    }, 1000);
+  } catch (error) {
+    setConnection("error", error.message || "Could not save absence");
+    showToast(error.message || "Could not save absence");
+    els.employeeAbsentSubmitButton.disabled = false;
+    els.employeeAbsentSubmitButton.textContent = "Submit";
+  }
+}
+
+function handleOperationsClick(event) {
+  const removeButton = event.target.closest(".absence-remove-button");
+  if (!removeButton) return;
+  if (!canMarkEmployeeAbsent()) return;
+  openRemoveAbsenceDialog(removeButton.dataset.worker || "");
+}
+
+function openRemoveAbsenceDialog(worker) {
+  if (!worker || !canMarkEmployeeAbsent()) return;
+  pendingRemoveAbsenceWorker = worker;
+  els.removeAbsenceTitle.textContent = `Remove today's absence for ${worker}?`;
+  els.removeAbsenceConfirmButton.disabled = false;
+  els.removeAbsenceConfirmButton.textContent = "Remove";
+  els.removeAbsenceDialog.hidden = false;
+  els.removeAbsenceCancelButton.focus();
+}
+
+function closeRemoveAbsenceDialog() {
+  pendingRemoveAbsenceWorker = "";
+  els.removeAbsenceDialog.hidden = true;
+  els.removeAbsenceConfirmButton.disabled = false;
+  els.removeAbsenceConfirmButton.textContent = "Remove";
+}
+
+async function removeEmployeeAbsence() {
+  const worker = pendingRemoveAbsenceWorker;
+  if (!worker || !canMarkEmployeeAbsent()) return closeRemoveAbsenceDialog();
+
+  els.removeAbsenceConfirmButton.disabled = true;
+  els.removeAbsenceConfirmButton.textContent = "Removing";
+  setConnection("loading", "Removing absence");
+  try {
+    await apiPost("removeEmployeeAbsence", {
+      token: state.auth?.token,
+      date: todayKey(),
+      worker,
+    });
+    payroll.absences = payroll.absences.filter((entry) => !(entry.worker === worker && entry.date === todayKey()));
+    payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === worker && entry.date === todayKey() && entry.status === "Absent"));
+    if (worker === currentWorker()) state.absenceDate = "";
+    closeRemoveAbsenceDialog();
+    setConnection("ready", "Absence removed");
+    showToast("✓ Absence removed.");
+    saveState();
+    render();
+    loadBootstrap({ quiet: true });
+  } catch (error) {
+    setConnection("error", error.message || "Could not remove absence");
+    showToast(error.message || "Could not remove absence");
+    els.removeAbsenceConfirmButton.disabled = false;
+    els.removeAbsenceConfirmButton.textContent = "Remove";
   }
 }
 
@@ -991,6 +1149,7 @@ function renderClock() {
   const absent = isAbsentToday();
   const clockDataReady = !bootstrapLoading && !!payroll.loadedAt;
   const canShowAbsentAction = !current && !absent && !hasClockedInToday();
+  const canShowEmployeeAbsentAction = !current && !absent && canMarkEmployeeAbsent();
   const connectionStatus = clockConnectionStatus();
   const connectionReady = connectionStatus.state === "ready";
 
@@ -1011,6 +1170,8 @@ function renderClock() {
   }
   els.absentButton.hidden = !connectionReady || !clockDataReady || !canShowAbsentAction;
   els.absentButton.textContent = "MARK ABSENT";
+  els.markEmployeeAbsentButton.hidden = !connectionReady || !clockDataReady || !canShowEmployeeAbsentAction;
+  els.markEmployeeAbsentButton.textContent = "MARK EMPLOYEE ABSENT";
   els.jobsiteHelper.hidden = !!current || absent || !canClock || !!selectedJobsite;
   renderReminderPanel();
   const problem = connectionStatus.state === "offline";
@@ -1224,6 +1385,7 @@ function buildOperationsGroups(absentWorkers) {
         status: "Absent",
         statusClass: "absent",
         clockIn: "",
+        canRemoveAbsence: canMarkEmployeeAbsent(),
       });
       return;
     }
@@ -1281,7 +1443,9 @@ function renderOperationsPerson(person) {
         ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
       </div>
       <span class="person-status-stack">
-        <span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>
+        ${person.canRemoveAbsence
+          ? `<button class="mini-pill absence-remove-button" type="button" data-worker="${escapeHtml(person.worker)}">Undo Absent</button>`
+          : `<span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>`}
         ${person.switched ? `<span class="switch-indicator">↔ Switched</span>` : ""}
       </span>
     </div>
