@@ -45,6 +45,9 @@ const els = {
   absentButton: document.querySelector("#absentButton"),
   markEmployeeAbsentButton: document.querySelector("#markEmployeeAbsentButton"),
   notificationButton: document.querySelector("#notificationButton"),
+  todayClockIn: document.querySelector("#todayClockIn"),
+  todayClockOut: document.querySelector("#todayClockOut"),
+  todayClockOutCard: document.querySelector("#todayClockOutCard"),
   reminderPanel: document.querySelector("#reminderPanel"),
   enableRemindersButton: document.querySelector("#enableRemindersButton"),
   remindersStatus: document.querySelector("#remindersStatus"),
@@ -57,6 +60,8 @@ const els = {
   clockedOutCount: document.querySelector("#clockedOutCount"),
   teamHours: document.querySelector("#teamHours"),
   teamList: document.querySelector("#teamList"),
+  myHoursPeriod: document.querySelector("#myHoursPeriod"),
+  myHoursList: document.querySelector("#myHoursList"),
   alertsList: document.querySelector("#alertsList"),
   retryButton: document.querySelector("#retryButton"),
   lunchDialog: document.querySelector("#lunchDialog"),
@@ -87,6 +92,19 @@ let payroll = {
   absences: [],
   clockStates: [],
   submissions: [],
+  myHours: [],
+  myHoursMessage: "",
+  myHoursLoadedAt: null,
+  myHoursLoading: false,
+  capabilities: {
+    canUseOperations: false,
+    canUseAlerts: false,
+  },
+  payrollPeriod: {
+    configured: false,
+    start: "",
+    end: "",
+  },
   loadedAt: null,
 };
 
@@ -306,13 +324,19 @@ async function loadBootstrap(options = {}) {
   bootstrapLoading = true;
   if (!options.quiet) setConnection("loading", "Refreshing Payroll 2.0");
   try {
-    const data = await apiGet("bootstrap");
+    const data = await apiPost("bootstrap", { token: state.auth?.token });
     payroll = {
       employees: arrayOrEmpty(data.employees),
       jobsites: arrayOrEmpty(data.jobsites),
       absences: arrayOrEmpty(data.absences),
       clockStates: arrayOrEmpty(data.clockStates),
       submissions: arrayOrEmpty(data.submissions),
+      myHours: payroll.myHours,
+      myHoursMessage: payroll.myHoursMessage,
+      myHoursLoadedAt: payroll.myHoursLoadedAt,
+      myHoursLoading: payroll.myHoursLoading,
+      capabilities: data.capabilities || payroll.capabilities || {},
+      payrollPeriod: data.payrollPeriod || payroll.payrollPeriod || {},
       loadedAt: new Date().toISOString(),
     };
     const employee = currentEmployee();
@@ -338,8 +362,27 @@ async function loadBootstrap(options = {}) {
   }
 }
 
+async function loadMyHours(options = {}) {
+  if (!state.auth || !apiReady()) return;
+  payroll.myHoursLoading = true;
+  if (options.renderBefore !== false && state.activeTab === "myHours") render();
+  try {
+    const data = await apiPost("myHours", { token: state.auth.token });
+    payroll.myHours = arrayOrEmpty(data.rows);
+    payroll.myHoursMessage = data.message || "";
+    payroll.payrollPeriod = data.payrollPeriod || payroll.payrollPeriod || {};
+    payroll.myHoursLoadedAt = new Date().toISOString();
+  } catch (error) {
+    payroll.myHours = [];
+    payroll.myHoursMessage = error.message || "Could not load My Hours.";
+  } finally {
+    payroll.myHoursLoading = false;
+    if (options.renderAfter !== false && state.activeTab === "myHours") render();
+  }
+}
+
 function refreshOperationsIfOpen() {
-  if (state.auth && isManagerMode() && state.activeTab === "operations") {
+  if (state.auth && canUseOperations() && state.activeTab === "operations") {
     loadBootstrap({ quiet: true });
   }
 }
@@ -364,10 +407,12 @@ function logout() {
 }
 
 function setActiveTab(tab) {
+  if (!canAccessTab(tab)) tab = firstAllowedTab();
   state.activeTab = tab;
   saveState();
   render();
   if (tab === "operations" || tab === "alerts") loadBootstrap({ quiet: true });
+  if (tab === "myHours") loadMyHours({ quiet: true });
 }
 
 function currentWorker() {
@@ -376,6 +421,25 @@ function currentWorker() {
 
 function currentRole() {
   return state.auth?.role || "Employee";
+}
+
+function roleText() {
+  return currentRole().toLowerCase();
+}
+
+function roleHasAny(words) {
+  const role = roleText();
+  return words.some((word) => role.includes(word));
+}
+
+function canUseOperations() {
+  if (payroll.loadedAt && typeof payroll.capabilities?.canUseOperations === "boolean") return payroll.capabilities.canUseOperations;
+  return roleHasAny(["foreman", "manager", "supervisor", "admin", "director"]);
+}
+
+function canUseAlerts() {
+  if (payroll.loadedAt && typeof payroll.capabilities?.canUseAlerts === "boolean") return payroll.capabilities.canUseAlerts;
+  return roleHasAny(["admin", "director"]);
 }
 
 function currentEmployee() {
@@ -389,17 +453,30 @@ function attendanceRequiredFor(worker = currentWorker()) {
 }
 
 function isManagerMode() {
-  const role = currentRole().toLowerCase();
-  return ["admin", "manager", "supervisor", "foreman", "lead", "operations", "office"].some((word) => role.includes(word));
+  return canUseOperations() || canUseAlerts();
 }
 
 function canMarkEmployeeAbsent() {
-  const role = currentRole().toLowerCase();
-  return ["admin", "manager", "foreman"].some((word) => role.includes(word));
+  return roleHasAny(["admin", "director", "manager", "foreman"]);
 }
 
 function canEnableDeviceNotifications() {
-  return attendanceRequiredFor() || isManagerMode();
+  return attendanceRequiredFor() || canUseOperations() || canUseAlerts();
+}
+
+function allowedTabs() {
+  const tabs = ["clock", "myHours"];
+  if (canUseOperations()) tabs.push("operations");
+  if (canUseAlerts()) tabs.push("alerts");
+  return tabs;
+}
+
+function firstAllowedTab() {
+  return allowedTabs()[0] || "clock";
+}
+
+function canAccessTab(tab) {
+  return allowedTabs().includes(tab);
 }
 
 function hasFcmConfig() {
@@ -567,6 +644,7 @@ async function toggleClock() {
     state.activeShifts[currentWorker()] = nextShift;
     saveState();
     setConnection("ready", "Clocked in");
+    await loadMyHours({ quiet: true, renderBefore: false, renderAfter: false });
     render();
     showToast("Clocked in");
   } catch (error) {
@@ -887,6 +965,7 @@ async function saveCompletedShift(shift) {
     });
     applyCompletedShiftSideEffects(shift);
     state.lastSync = "Saved to Payroll 2.0";
+    await loadMyHours({ quiet: true, renderBefore: false, renderAfter: false });
     saveState();
     setConnection("ready", "Saved to Payroll 2.0");
     return { ok: true, data };
@@ -1135,31 +1214,37 @@ function render() {
   showApp();
   renderShell();
   renderClock();
-  if (isManagerMode()) {
-    renderOperations();
-    renderAlerts();
-  }
+  renderMyHours();
+  if (canUseOperations()) renderOperations();
+  if (canUseAlerts()) renderAlerts();
 }
 
 function renderShell() {
   els.workerName.textContent = currentWorker();
   els.workerRole.textContent = currentRole() || "Employee";
-  const manager = isManagerMode();
-  els.managerTabs.hidden = !manager;
-  if (!manager) state.activeTab = "clock";
+  const tabs = allowedTabs();
+  if (!canAccessTab(state.activeTab)) state.activeTab = firstAllowedTab();
+  els.managerTabs.hidden = false;
+  els.managerTabs.style.setProperty("--tab-count", String(tabs.length));
   renderAlertsTabIndicator();
-  els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
+  els.tabs.forEach((tab) => {
+    const allowed = tabs.includes(tab.dataset.tab);
+    tab.hidden = !allowed;
+    tab.disabled = !allowed;
+    tab.classList.toggle("active", allowed && tab.dataset.tab === state.activeTab);
+  });
   els.views.forEach((view) => {
     const key = view.id.replace("View", "");
-    view.classList.toggle("active", key === state.activeTab || (!manager && key === "clock"));
+    view.classList.toggle("active", key === state.activeTab && canAccessTab(key));
   });
   els.connectionBar.hidden = false;
 }
 
 function renderAlertsTabIndicator() {
   if (!els.alertsTab) return;
-  if (!isManagerMode()) {
+  if (!canUseAlerts()) {
     els.alertsTab.textContent = "Alerts";
+    els.alertsTab.setAttribute("aria-label", "Alerts");
     return;
   }
   const hasActionableAlerts = alertItemCount(buildAlertSections().filter((section) => section.actionable)) > 0;
@@ -1242,7 +1327,25 @@ function renderClock() {
   els.lunchStatus.textContent = current ? "Pending" : lastRow ? lastRow.lunch : "Pending";
   els.rowCount.textContent = String(rows.length);
   els.entryCount.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  renderTodayClockStatusCards();
   renderCompletedRows(rows);
+}
+
+function renderTodayClockStatusCards() {
+  const summary = dailyTimeSummaryFor(currentWorker(), todayKey());
+  els.todayClockIn.textContent = summary.clockInAt ? timeLabel(summary.clockInAt) : "Not Clocked In";
+  const clockOut = clockOutDisplay(summary);
+  els.todayClockOut.textContent = clockOut.text;
+  els.todayClockOutCard.classList.toggle("pending", clockOut.state === "pending");
+  els.todayClockOutCard.classList.toggle("complete", clockOut.state === "complete");
+  els.todayClockOutCard.classList.toggle("incomplete", clockOut.state === "incomplete");
+}
+
+function clockOutDisplay(summary) {
+  if (summary.pending) return { text: "Pending", state: "pending" };
+  if (summary.clockOutAt) return { text: timeLabel(summary.clockOutAt), state: "complete" };
+  if (summary.clockInAt) return { text: "Not Clocked Out", state: "incomplete" };
+  return { text: "—", state: "empty" };
 }
 
 function clockConnectionStatus() {
@@ -1259,6 +1362,88 @@ function clockConnectionStatus() {
     return { state: "connecting", text: "🟡 Connecting...", className: "connecting" };
   }
   return { state: "ready", text: "🟢 Ready for Clock In", className: "ready" };
+}
+
+function renderMyHours() {
+  if (!els.myHoursList) return;
+  const period = payroll.payrollPeriod || {};
+  if (payroll.myHoursLoading) {
+    els.myHoursPeriod.textContent = "Loading current payroll period";
+    els.myHoursList.innerHTML = `<p class="empty-state">Loading My Hours...</p>`;
+    return;
+  }
+  if (!period.configured) {
+    els.myHoursPeriod.textContent = "";
+    els.myHoursList.innerHTML = `<p class="empty-state">${escapeHtml(payroll.myHoursMessage || "Current payroll period has not been set.")}</p>`;
+    return;
+  }
+
+  els.myHoursPeriod.innerHTML = `
+    <span>Current Payroll Period</span>
+    <strong>${escapeHtml(dateLabel(period.start))} &ndash; ${escapeHtml(dateLabel(period.end))}</strong>
+  `;
+  const rows = myHoursRowsForDisplay();
+  if (!rows.length) {
+    els.myHoursList.innerHTML = `<p class="empty-state">No clock records in the current payroll period</p>`;
+    return;
+  }
+
+  els.myHoursList.innerHTML = `
+    <div class="my-hours-table" role="table" aria-label="My Hours for current payroll period">
+      <div class="my-hours-row my-hours-header" role="row">
+        <span role="columnheader">Date / Day</span>
+        <span role="columnheader">Clock In</span>
+        <span role="columnheader">Clock Out</span>
+      </div>
+      ${rows.map(renderMyHoursRow).join("")}
+    </div>
+  `;
+}
+
+function myHoursRowsForDisplay() {
+  const period = payroll.payrollPeriod || {};
+  if (!period.configured) return [];
+  const byDate = {};
+  payroll.myHours.forEach((row) => {
+    if (!dateWithinPeriod(row.date, period)) return;
+    const summary = byDate[row.date] || emptyDailyTimeSummary(row.date);
+    if (row.clockInAt) summary.clockInAt = earliestTime(summary.clockInAt, row.clockInAt);
+    if (row.clockOutAt) summary.clockOutAt = latestTime(summary.clockOutAt, row.clockOutAt);
+    if (row.pending) summary.pending = true;
+    byDate[row.date] = summary;
+  });
+
+  const today = todayKey();
+  if (dateWithinPeriod(today, period)) {
+    const todaySummary = dailyTimeSummaryFor(currentWorker(), today);
+    if (todaySummary.clockInAt || todaySummary.clockOutAt || todaySummary.pending) {
+      const summary = byDate[today] || emptyDailyTimeSummary(today);
+      summary.clockInAt = earliestTime(summary.clockInAt, todaySummary.clockInAt);
+      summary.clockOutAt = latestTime(summary.clockOutAt, todaySummary.clockOutAt);
+      summary.pending = summary.pending || todaySummary.pending;
+      summary.incomplete = !!summary.clockInAt && !summary.clockOutAt && !summary.pending;
+      byDate[today] = summary;
+    }
+  }
+
+  return Object.keys(byDate)
+    .sort((a, b) => b.localeCompare(a))
+    .map((date) => {
+      const row = byDate[date];
+      row.incomplete = !!row.clockInAt && !row.clockOutAt && !row.pending;
+      return row;
+    });
+}
+
+function renderMyHoursRow(row) {
+  const out = clockOutDisplay(row);
+  return `
+    <div class="my-hours-row" role="row">
+      <span role="cell">${escapeHtml(compactDateDayLabel(row.date))}</span>
+      <strong role="cell">${row.clockInAt ? timeLabel(row.clockInAt) : "Not Clocked In"}</strong>
+      <strong role="cell" class="my-hours-out ${escapeAttribute(out.state)}">${escapeHtml(out.text)}</strong>
+    </div>
+  `;
 }
 
 function renderCompletedRows(rows) {
@@ -1314,6 +1499,10 @@ function renderReminderPanel() {
 }
 
 function renderOperations() {
+  if (!canUseOperations()) {
+    els.teamList.innerHTML = "";
+    return;
+  }
   const activeEntries = Object.values(state.activeShifts).filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
   const completed = state.shifts.filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
   const todayStates = payroll.clockStates.filter((entry) => entry.date === todayKey());
@@ -1605,6 +1794,62 @@ function dedupeSegments(segments) {
   });
 }
 
+function dailyTimeSummaryFor(worker, dateKey) {
+  const summary = emptyDailyTimeSummary(dateKey);
+  const workerKey = keyForCompare(worker);
+  payroll.submissions
+    .filter((row) => keyForCompare(row.worker) === workerKey && row.date === dateKey)
+    .forEach((row) => mergeCompletedTime(summary, row.clockInAt, row.clockOutAt));
+
+  state.shifts
+    .filter((shift) => keyForCompare(shift.worker) === workerKey && localDateKey(new Date(shift.start)) === dateKey && shift.syncStatus === "saved")
+    .forEach((shift) => mergeCompletedTime(summary, shift.start, shift.end));
+
+  payroll.clockStates
+    .filter((entry) => keyForCompare(entry.worker) === workerKey && entry.date === dateKey)
+    .forEach((entry) => {
+      if (entry.status === "Clocked In") mergeOpenTime(summary, entry.clockInAt);
+      if (entry.status === "Clocked Out") mergeCompletedTime(summary, entry.clockInAt, entry.clockOutAt);
+    });
+
+  const active = state.activeShifts[worker];
+  if (active && localDateKey(new Date(active.start)) === dateKey) mergeOpenTime(summary, active.start);
+  summary.incomplete = !!summary.clockInAt && !summary.clockOutAt && !summary.pending;
+  return summary;
+}
+
+function emptyDailyTimeSummary(dateKey) {
+  return {
+    date: dateKey,
+    clockInAt: "",
+    clockOutAt: "",
+    pending: false,
+    incomplete: false,
+  };
+}
+
+function mergeCompletedTime(summary, start, end) {
+  if (start) summary.clockInAt = earliestTime(summary.clockInAt, start);
+  if (end) summary.clockOutAt = latestTime(summary.clockOutAt, end);
+}
+
+function mergeOpenTime(summary, start) {
+  if (start) summary.clockInAt = earliestTime(summary.clockInAt, start);
+  summary.pending = true;
+}
+
+function earliestTime(current, candidate) {
+  if (!candidate) return current || "";
+  if (!current) return candidate;
+  return Date.parse(candidate) < Date.parse(current) ? candidate : current;
+}
+
+function latestTime(current, candidate) {
+  if (!candidate) return current || "";
+  if (!current) return candidate;
+  return Date.parse(candidate) > Date.parse(current) ? candidate : current;
+}
+
 function compareSegments(a, b) {
   return segmentTimeValue(a) - segmentTimeValue(b);
 }
@@ -1619,6 +1864,10 @@ function keyForCompare(value) {
 }
 
 function renderAlerts() {
+  if (!canUseAlerts()) {
+    els.alertsList.innerHTML = "";
+    return;
+  }
   const groups = buildAlertGroups();
   const signature = alertGroupsSignature(groups);
   if (els.alertsList.dataset.alertSignature === signature) return;
@@ -1905,6 +2154,38 @@ function timeLabel(iso) {
     minute: "2-digit",
     timeZone: APP_TIME_ZONE,
   }).format(new Date(iso));
+}
+
+function compactDateDayLabel(dateKey) {
+  const date = dateFromKey(dateKey);
+  if (!date) return dateKey || "";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    weekday: "short",
+    timeZone: APP_TIME_ZONE,
+  }).format(date).replace(",", "");
+}
+
+function dateLabel(dateKey) {
+  const date = dateFromKey(dateKey);
+  if (!date) return dateKey || "";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: APP_TIME_ZONE,
+  }).format(date);
+}
+
+function dateFromKey(dateKey) {
+  const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  return new Date(`${match[1]}-${match[2]}-${match[3]}T12:00:00Z`);
+}
+
+function dateWithinPeriod(dateKey, period) {
+  return !!dateKey && !!period?.start && !!period?.end && dateKey >= period.start && dateKey <= period.end;
 }
 
 function isAfterStillClockedInAlertTime(date = new Date()) {

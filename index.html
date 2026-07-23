@@ -10,7 +10,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="32x32" href="./assets/app-icon-32-v2.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/app-icon-180-v2.png" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=20260723-my-hours" />
     <script>
       window.CREW_CLOCK_CONFIG = {
         // Paste the Apps Script Web App URL after deploying CrewClockBackend.gs.
@@ -78,8 +78,9 @@
         <span id="connectionText">Connected to Payroll 2.0</span>
       </div>
 
-      <nav class="tabs" id="managerTabs" aria-label="Manager sections" hidden>
+      <nav class="tabs" id="managerTabs" aria-label="Crew Clock sections" hidden>
         <button class="tab active" type="button" data-tab="clock">Clock</button>
+        <button class="tab" type="button" data-tab="myHours">My Hours</button>
         <button class="tab" type="button" data-tab="operations">Operations</button>
         <button class="tab" type="button" data-tab="alerts">Alerts</button>
       </nav>
@@ -125,6 +126,16 @@
           <button class="secondary-button absence-button" id="absentButton" type="button" hidden>MARK ABSENT</button>
           <button class="secondary-button absence-button" id="markEmployeeAbsentButton" type="button" hidden>MARK EMPLOYEE ABSENT</button>
           <button class="secondary-button notification-button" id="notificationButton" type="button" hidden>🔔 ENABLE NOTIFICATIONS</button>
+          <section class="clock-status-cards" aria-label="Today's clock status">
+            <article class="clock-status-card">
+              <span>Clock In</span>
+              <strong id="todayClockIn">Not Clocked In</strong>
+            </article>
+            <article class="clock-status-card" id="todayClockOutCard">
+              <span>Clock Out</span>
+              <strong id="todayClockOut">Not Clocked Out</strong>
+            </article>
+          </section>
         </section>
 
         <section class="reminder-panel" id="reminderPanel" aria-label="Clock reminders" hidden>
@@ -153,6 +164,19 @@
             <span id="entryCount" class="muted"></span>
           </div>
           <div id="timelineList" class="timeline-list"></div>
+        </section>
+      </section>
+
+      <section class="view" id="myHoursView" aria-labelledby="myHoursTitle">
+        <div class="team-head">
+          <div>
+            <p class="eyebrow">Personal</p>
+            <h2 id="myHoursTitle">My Hours</h2>
+          </div>
+        </div>
+        <section class="my-hours-panel" aria-label="My clock history">
+          <div id="myHoursPeriod" class="my-hours-period"></div>
+          <div id="myHoursList" class="my-hours-list"></div>
         </section>
       </section>
 
@@ -296,6 +320,6 @@
 
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
-    <script src="./app.js?v=20260715-clock-ui"></script>
+    <script src="./app.js?v=20260723-my-hours"></script>
   </body>
 </html>

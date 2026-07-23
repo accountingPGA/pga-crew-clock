@@ -283,7 +283,7 @@ h2 {
 
 .tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--tab-count, 3), minmax(0, 1fr));
   gap: 8px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--line);
@@ -335,6 +335,7 @@ h2 {
 .status-panel,
 .reminder-panel,
 .timeline-panel,
+.my-hours-panel,
 .team-list-section {
   margin-bottom: 14px;
   padding: 16px;
@@ -485,6 +486,58 @@ h2 {
   font-size: 13px;
   font-weight: 820;
   line-height: 1;
+}
+
+.clock-status-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.clock-status-card {
+  min-width: 0;
+  min-height: 86px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.clock-status-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.clock-status-card strong {
+  display: block;
+  overflow-wrap: anywhere;
+  margin-top: 10px;
+  color: var(--ink);
+  font-size: 23px;
+  font-weight: 860;
+  line-height: 1.08;
+}
+
+.clock-status-card.pending,
+.clock-status-card.incomplete {
+  border-top-color: var(--warning);
+}
+
+.clock-status-card.pending strong,
+.clock-status-card.incomplete strong {
+  color: var(--warning);
+}
+
+.clock-status-card.complete {
+  border-top-color: var(--success);
+}
+
+.clock-status-card.complete strong {
+  color: var(--success);
 }
 
 .status-topline,
@@ -763,6 +816,7 @@ textarea {
 
 .timeline-list,
 .team-list,
+.my-hours-list,
 .alerts-list {
   display: grid;
   gap: 10px;
@@ -775,6 +829,79 @@ textarea {
 
 .alerts-list {
   gap: 16px;
+}
+
+.my-hours-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.my-hours-period {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.my-hours-period span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.my-hours-period strong {
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 820;
+}
+
+.my-hours-table {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.my-hours-row {
+  display: grid;
+  grid-template-columns: minmax(104px, 1.2fr) minmax(82px, 0.9fr) minmax(92px, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.my-hours-row:first-child {
+  border-top: 0;
+}
+
+.my-hours-header {
+  background: var(--surface-alt);
+}
+
+.my-hours-row span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.my-hours-row strong {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 820;
+}
+
+.my-hours-out.pending,
+.my-hours-out.incomplete {
+  color: var(--warning);
+}
+
+.my-hours-out.complete {
+  color: var(--success);
 }
 
 .jobsite-group {
