@@ -607,17 +607,10 @@ async function finishClockOut(lunch) {
     clearOpenShift: true,
     syncStatus: "pending",
   };
-  delete state.activeShifts[currentWorker()];
-  state.selectedJobsite = "";
   state.shifts.unshift(completed);
   state.lastSync = "Saving";
   saveState();
   render();
-  try {
-    await recordClockState("Clocked Out", completed);
-  } catch (error) {
-    setConnection("error", error.message || "Open shift close failed");
-  }
   await saveCompletedShift(completed);
 }
 
@@ -845,28 +838,20 @@ async function switchJobsite() {
     syncStatus: "pending",
   };
 
-  const nextShift = {
+  completed.nextOpenShift = {
     id: newId(),
     worker: currentWorker(),
     jobsite: nextJobsite,
     start: now,
     travelFrom: current.jobsite,
   };
-  state.activeShifts[currentWorker()] = nextShift;
-  state.selectedJobsite = nextJobsite;
   state.shifts.unshift(completed);
   state.lastSync = "Saving";
   closeSwitchDialog();
   saveState();
   render();
-  try {
-    await recordClockState("Clocked In", nextShift);
-  } catch (error) {
-    setConnection("error", error.message || "Open shift update failed");
-    showToast("Open shift update failed");
-  }
-  await saveCompletedShift(completed);
-  showToast("New jobsite started");
+  const result = await saveCompletedShift(completed);
+  if (result?.ok) showToast("New jobsite started");
 }
 
 async function recordClockState(status, shift = {}) {
@@ -900,21 +885,59 @@ async function saveCompletedShift(shift) {
       submissionId: data.submissionId,
       error: "",
     });
+    applyCompletedShiftSideEffects(shift);
     state.lastSync = "Saved to Payroll 2.0";
     saveState();
     setConnection("ready", "Saved to Payroll 2.0");
+    return { ok: true, data };
   } catch (error) {
     if (isSessionExpiredError(error)) {
       handleExpiredSessionSave(shift);
-      return;
+      return { ok: false, error };
     }
     updateShiftSync(shift.id, { syncStatus: "failed", error: error.message });
     await notifySaveProblem(shift, error);
     state.lastSync = "Save failed, try again";
     saveState();
     setConnection("error", "Save failed, try again");
+    return { ok: false, error };
   } finally {
     render();
+  }
+}
+
+function applyCompletedShiftSideEffects(shift) {
+  const shiftDate = localDateKey(new Date(shift.start));
+  payroll.clockStates = payroll.clockStates.filter((entry) => !(entry.worker === shift.worker && entry.date === shiftDate));
+  if (shift.nextOpenShift) {
+    const next = shift.nextOpenShift;
+    state.activeShifts[shift.worker] = next;
+    state.selectedJobsite = next.jobsite;
+    payroll.clockStates.push({
+      worker: shift.worker,
+      date: localDateKey(new Date(next.start)),
+      status: "Clocked In",
+      jobsite: next.jobsite,
+      clockInAt: next.start,
+      clockOutAt: "",
+      sessionId: next.id,
+      deviceId: state.deviceId || "",
+    });
+    return;
+  }
+  if (shift.clearOpenShift) {
+    delete state.activeShifts[shift.worker];
+    if (shift.worker === currentWorker()) state.selectedJobsite = "";
+    payroll.clockStates.push({
+      worker: shift.worker,
+      date: shiftDate,
+      status: "Clocked Out",
+      jobsite: shift.jobsite,
+      clockInAt: shift.start,
+      clockOutAt: shift.end,
+      sessionId: shift.id,
+      deviceId: state.deviceId || "",
+    });
   }
 }
 
@@ -1093,6 +1116,14 @@ function toSubmissionPayload(shift) {
     lunch: shift.lunch === "Yes" ? "Yes" : "No",
     notes: "",
     clearOpenShift: !!shift.clearOpenShift,
+    nextOpenShift: shift.nextOpenShift ? {
+      clientShiftId: shift.nextOpenShift.id,
+      worker: shift.nextOpenShift.worker,
+      date: localDateKey(new Date(shift.nextOpenShift.start)),
+      jobsite: shift.nextOpenShift.jobsite,
+      startIso: shift.nextOpenShift.start,
+      deviceId: state.deviceId || "",
+    } : null,
   };
 }
 
