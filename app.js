@@ -93,6 +93,7 @@ let payroll = {
   clockStates: [],
   submissions: [],
   myHours: [],
+  myHoursSummary: null,
   myHoursMessage: "",
   myHoursLoadedAt: null,
   myHoursLoading: false,
@@ -298,6 +299,7 @@ async function loginWithPin() {
       worker: data.employee.worker,
       role: data.employee.role || "Employee",
       attendanceRequired: data.employee.attendanceRequired || "No",
+      workerType: normalizeWorkerType(data.employee.workerType),
       expiresAt: data.expiresAt,
       signedInAt: new Date().toISOString(),
     };
@@ -332,6 +334,7 @@ async function loadBootstrap(options = {}) {
       clockStates: arrayOrEmpty(data.clockStates),
       submissions: arrayOrEmpty(data.submissions),
       myHours: payroll.myHours,
+      myHoursSummary: payroll.myHoursSummary,
       myHoursMessage: payroll.myHoursMessage,
       myHoursLoadedAt: payroll.myHoursLoadedAt,
       myHoursLoading: payroll.myHoursLoading,
@@ -342,6 +345,7 @@ async function loadBootstrap(options = {}) {
     const employee = currentEmployee();
     if (employee && state.auth) {
       state.auth.attendanceRequired = employee.attendanceRequired || state.auth.attendanceRequired || "No";
+      state.auth.workerType = normalizeWorkerType(employee.workerType || state.auth.workerType);
     }
     if (state.selectedJobsite && !payroll.jobsites.some((jobsite) => jobsite.jobsite === state.selectedJobsite)) {
       state.selectedJobsite = "";
@@ -369,11 +373,14 @@ async function loadMyHours(options = {}) {
   try {
     const data = await apiPost("myHours", { token: state.auth.token });
     payroll.myHours = arrayOrEmpty(data.rows);
+    payroll.myHoursSummary = data.payrollSummary || null;
     payroll.myHoursMessage = data.message || "";
     payroll.payrollPeriod = data.payrollPeriod || payroll.payrollPeriod || {};
+    if (state.auth && data.workerType) state.auth.workerType = normalizeWorkerType(data.workerType);
     payroll.myHoursLoadedAt = new Date().toISOString();
   } catch (error) {
     payroll.myHours = [];
+    payroll.myHoursSummary = null;
     payroll.myHoursMessage = error.message || "Could not load My Hours.";
   } finally {
     payroll.myHoursLoading = false;
@@ -1383,8 +1390,12 @@ function renderMyHours() {
     <strong>${escapeHtml(dateLabel(period.start))} &ndash; ${escapeHtml(dateLabel(period.end))}</strong>
   `;
   const rows = myHoursRowsForDisplay();
+  const summaryCards = renderMyHoursSummaryCards();
   if (!rows.length) {
-    els.myHoursList.innerHTML = `<p class="empty-state">No clock records in the current payroll period</p>`;
+    els.myHoursList.innerHTML = `
+      <p class="empty-state">No clock records in the current payroll period</p>
+      ${summaryCards}
+    `;
     return;
   }
 
@@ -1397,7 +1408,51 @@ function renderMyHours() {
       </div>
       ${rows.map(renderMyHoursRow).join("")}
     </div>
+    ${summaryCards}
   `;
+}
+
+function renderMyHoursSummaryCards() {
+  const summary = payroll.myHoursSummary || {};
+  const workerType = normalizeWorkerType(summary.workerType || currentWorkerType());
+  const pending = summary.status !== "ready";
+  const cards = workerType === "Subcontractor"
+    ? [{ label: "Total Hours", value: summary.totalHours }]
+    : [
+        { label: "Regular Hours", value: summary.regularHours },
+        { label: "OT Hours", value: summary.otHours },
+      ];
+
+  return `
+    <section class="my-hours-summary-cards" aria-label="Payroll summary">
+      ${cards.map((card) => `
+        <article class="my-hours-summary-card${pending ? " pending" : ""}">
+          <span>${escapeHtml(card.label)}</span>
+          <strong>${escapeHtml(payrollHoursValue(card.value, pending))}</strong>
+        </article>
+      `).join("")}
+    </section>
+  `;
+}
+
+function payrollHoursValue(value, pending) {
+  if (pending) return "Pending Payroll";
+  return formatPayrollHours(value);
+}
+
+function formatPayrollHours(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0.00";
+  return n.toFixed(2);
+}
+
+function currentWorkerType() {
+  const employee = currentEmployee();
+  return normalizeWorkerType(employee?.workerType || state.auth?.workerType);
+}
+
+function normalizeWorkerType(value) {
+  return String(value || "").trim().toLowerCase() === "subcontractor" ? "Subcontractor" : "Employee";
 }
 
 function myHoursRowsForDisplay() {

@@ -904,6 +904,47 @@ textarea {
   color: var(--success);
 }
 
+.my-hours-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.my-hours-summary-card {
+  display: grid;
+  gap: 6px;
+  min-height: 88px;
+  align-content: center;
+  border: 1px solid #b7dfcc;
+  border-radius: 8px;
+  background: #f0faf5;
+  padding: 14px;
+}
+
+.my-hours-summary-card span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 820;
+  text-transform: uppercase;
+}
+
+.my-hours-summary-card strong {
+  color: var(--success);
+  font-size: 22px;
+  font-weight: 860;
+  line-height: 1.1;
+}
+
+.my-hours-summary-card.pending {
+  border-color: #f3c99a;
+  background: #fff8ed;
+}
+
+.my-hours-summary-card.pending strong {
+  color: var(--warning);
+  font-size: 16px;
+}
+
 .jobsite-group {
   overflow: hidden;
   border: 1px solid var(--line);
