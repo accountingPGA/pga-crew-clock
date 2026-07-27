@@ -1272,7 +1272,7 @@ function renderClock() {
   const absent = isAbsentToday();
   const clockDataReady = !bootstrapLoading && !!payroll.loadedAt;
   const canShowAbsentAction = !current && !absent && !hasClockedInToday();
-  const canShowEmployeeAbsentAction = !current && !absent && canMarkEmployeeAbsent();
+  const canShowEmployeeAbsentAction = !absent && canMarkEmployeeAbsent();
   const connectionStatus = clockConnectionStatus();
   const connectionReady = connectionStatus.state === "ready";
 
