@@ -1648,6 +1648,7 @@ function buildOperationsGroups(absentWorkers) {
     } : null);
     const activeForHistory = active || null;
     const recent = latestCompletedSegmentFor(employee.worker);
+    const clockOutAt = latestCompletedClockOutFor(employee.worker) || stateRow?.clockOutAt || recent?.end || "";
     const transferHistory = transferHistoryFor(employee.worker, activeForHistory);
     const absent = absentWorkers.has(employee.worker);
     const clockedOut = !!recent || stateRow?.status === "Clocked Out";
@@ -1677,7 +1678,7 @@ function buildOperationsGroups(absentWorkers) {
 
     groups.get(jobsite).people.push({
       worker: employee.worker,
-      status: active ? "Clocked In" : "Clocked Out",
+      status: active ? "Clocked In" : clockOutAt ? `Clocked Out ${timeLabel(clockOutAt)}` : "Clocked Out",
       statusClass: active ? "" : "out",
       clockIn: active?.start || recent?.start || stateRow?.clockInAt || "",
       switched: transferHistory.length > 0,
@@ -1776,6 +1777,10 @@ function renderTransferHistory(transfers) {
 function latestCompletedSegmentFor(worker) {
   const segments = completedSegmentsFor(worker);
   return segments.length ? segments[segments.length - 1] : null;
+}
+
+function latestCompletedClockOutFor(worker) {
+  return completedSegmentsFor(worker).reduce((latest, segment) => latestTime(latest, segment.end), "");
 }
 
 function transferHistoryFor(worker, active) {
