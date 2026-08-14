@@ -76,7 +76,6 @@ const els = {
   crewScheduleStart: document.querySelector("#crewScheduleStart"),
   crewScheduleEnd: document.querySelector("#crewScheduleEnd"),
   crewScheduleSubmitButton: document.querySelector("#crewScheduleSubmitButton"),
-  crewScheduleSkipButton: document.querySelector("#crewScheduleSkipButton"),
   absentDialog: document.querySelector("#absentDialog"),
   absentYesButton: document.querySelector("#absentYesButton"),
   absentNoButton: document.querySelector("#absentNoButton"),
@@ -244,7 +243,6 @@ function setup() {
   els.switchConfirmButton.addEventListener("click", switchJobsite);
   els.switchCancelButton.addEventListener("click", closeSwitchDialog);
   els.crewScheduleSubmitButton.addEventListener("click", submitCrewScheduleClockOut);
-  els.crewScheduleSkipButton.addEventListener("click", skipCrewScheduleClockOut);
   els.absentYesButton.addEventListener("click", markAbsentToday);
   els.absentNoButton.addEventListener("click", closeAbsentDialog);
   els.employeeAbsentSubmitButton.addEventListener("click", submitEmployeeAbsence);
@@ -750,8 +748,7 @@ function openCrewScheduleDialog(shift, lunch) {
   pendingCrewScheduleLunch = lunch;
   lunchDialogMode = "";
   els.lunchDialog.hidden = true;
-  const site = shift.jobsite || "this jobsite";
-  els.crewScheduleContext.textContent = `What was the crew's scheduled shift today at ${site}?`;
+  els.crewScheduleContext.textContent = "Confirm the crew's scheduled start and end time for this jobsite.";
   if (!els.crewScheduleStart.value) els.crewScheduleStart.value = "07:00";
   if (!els.crewScheduleEnd.value) els.crewScheduleEnd.value = "15:30";
   els.crewScheduleDialog.hidden = false;
@@ -763,7 +760,6 @@ function closeCrewScheduleDialog() {
   pendingCrewScheduleLunch = "";
   els.crewScheduleDialog.hidden = true;
   els.crewScheduleSubmitButton.disabled = false;
-  els.crewScheduleSkipButton.disabled = false;
 }
 
 async function submitCrewScheduleClockOut() {
@@ -775,19 +771,7 @@ async function submitCrewScheduleClockOut() {
   const schedule = buildCrewScheduleReport(current);
   if (!schedule) return;
   els.crewScheduleSubmitButton.disabled = true;
-  els.crewScheduleSkipButton.disabled = true;
   await completeClockOut(current, pendingCrewScheduleLunch, schedule);
-}
-
-async function skipCrewScheduleClockOut() {
-  const current = currentActiveShift();
-  if (!current || current.id !== pendingCrewScheduleShiftId) {
-    closeCrewScheduleDialog();
-    return;
-  }
-  els.crewScheduleSubmitButton.disabled = true;
-  els.crewScheduleSkipButton.disabled = true;
-  await completeClockOut(current, pendingCrewScheduleLunch, null);
 }
 
 function buildCrewScheduleReport(shift) {
