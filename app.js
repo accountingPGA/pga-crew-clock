@@ -71,6 +71,12 @@ const els = {
   switchSiteSelect: document.querySelector("#switchSiteSelect"),
   switchConfirmButton: document.querySelector("#switchConfirmButton"),
   switchCancelButton: document.querySelector("#switchCancelButton"),
+  crewScheduleDialog: document.querySelector("#crewScheduleDialog"),
+  crewScheduleContext: document.querySelector("#crewScheduleContext"),
+  crewScheduleStart: document.querySelector("#crewScheduleStart"),
+  crewScheduleEnd: document.querySelector("#crewScheduleEnd"),
+  crewScheduleSubmitButton: document.querySelector("#crewScheduleSubmitButton"),
+  crewScheduleSkipButton: document.querySelector("#crewScheduleSkipButton"),
   absentDialog: document.querySelector("#absentDialog"),
   absentYesButton: document.querySelector("#absentYesButton"),
   absentNoButton: document.querySelector("#absentNoButton"),
@@ -100,6 +106,7 @@ let payroll = {
   capabilities: {
     canUseOperations: false,
     canUseAlerts: false,
+    canReportCrewSchedule: false,
   },
   payrollPeriod: {
     configured: false,
@@ -115,6 +122,8 @@ let pendingClockOutShiftId = null;
 let lunchDialogMode = "";
 let pendingSwitchShiftId = null;
 let pendingSwitchLunch = "";
+let pendingCrewScheduleShiftId = null;
+let pendingCrewScheduleLunch = "";
 let pendingRemoveAbsenceWorker = "";
 let toastTimer;
 let renderTimer;
@@ -130,6 +139,7 @@ function defaultState() {
     selectedJobsite: "",
     activeShifts: {},
     shifts: [],
+    scheduleReports: [],
     absenceDate: "",
     expandedAlertSections: {},
     expandedTransfers: {},
@@ -146,7 +156,7 @@ function loadState() {
   try {
     const parsed = JSON.parse(saved);
     if (parsed.day === todayKey()) {
-      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, expandedAlertSections: parsed.expandedAlertSections || {}, expandedTransfers: parsed.expandedTransfers || {} };
+      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, shifts: parsed.shifts || [], scheduleReports: parsed.scheduleReports || [], expandedAlertSections: parsed.expandedAlertSections || {}, expandedTransfers: parsed.expandedTransfers || {} };
       if (!hydrated.auth?.worker || !hydrated.activeShifts?.[hydrated.auth.worker]) {
         hydrated.selectedJobsite = "";
       }
@@ -233,6 +243,8 @@ function setup() {
   els.lunchNoButton.addEventListener("click", () => handleLunchAnswer("No"));
   els.switchConfirmButton.addEventListener("click", switchJobsite);
   els.switchCancelButton.addEventListener("click", closeSwitchDialog);
+  els.crewScheduleSubmitButton.addEventListener("click", submitCrewScheduleClockOut);
+  els.crewScheduleSkipButton.addEventListener("click", skipCrewScheduleClockOut);
   els.absentYesButton.addEventListener("click", markAbsentToday);
   els.absentNoButton.addEventListener("click", closeAbsentDialog);
   els.employeeAbsentSubmitButton.addEventListener("click", submitEmployeeAbsence);
@@ -447,6 +459,11 @@ function canUseOperations() {
 function canUseAlerts() {
   if (payroll.loadedAt && typeof payroll.capabilities?.canUseAlerts === "boolean") return payroll.capabilities.canUseAlerts;
   return roleHasAny(["admin", "director"]);
+}
+
+function canReportCrewSchedule() {
+  if (payroll.loadedAt && typeof payroll.capabilities?.canReportCrewSchedule === "boolean") return payroll.capabilities.canReportCrewSchedule;
+  return roleHasAny(["foreman", "manager", "supervisor", "admin", "director"]);
 }
 
 function currentEmployee() {
@@ -684,7 +701,17 @@ async function finishClockOut(lunch) {
     return;
   }
 
+  if (canReportCrewSchedule()) {
+    openCrewScheduleDialog(current, lunch);
+    return;
+  }
+
+  await completeClockOut(current, lunch, null);
+}
+
+async function completeClockOut(current, lunch, crewSchedule) {
   closeLunchDialog();
+  closeCrewScheduleDialog();
   const completed = {
     ...current,
     end: new Date().toISOString(),
@@ -692,6 +719,17 @@ async function finishClockOut(lunch) {
     clearOpenShift: true,
     syncStatus: "pending",
   };
+  if (crewSchedule) {
+    completed.crewScheduleId = crewSchedule.id;
+    queueCrewScheduleReport({
+      ...crewSchedule,
+      linkedShiftId: completed.id,
+      shiftStartIso: completed.start,
+      shiftEndIso: completed.end,
+      syncStatus: "waiting",
+      error: "",
+    });
+  }
   state.shifts.unshift(completed);
   state.lastSync = "Saving";
   saveState();
@@ -705,6 +743,85 @@ function closeLunchDialog() {
   pendingSwitchLunch = "";
   lunchDialogMode = "";
   els.lunchDialog.hidden = true;
+}
+
+function openCrewScheduleDialog(shift, lunch) {
+  pendingCrewScheduleShiftId = shift.id;
+  pendingCrewScheduleLunch = lunch;
+  lunchDialogMode = "";
+  els.lunchDialog.hidden = true;
+  const site = shift.jobsite || "this jobsite";
+  els.crewScheduleContext.textContent = `What was the crew's scheduled shift today at ${site}?`;
+  if (!els.crewScheduleStart.value) els.crewScheduleStart.value = "07:00";
+  if (!els.crewScheduleEnd.value) els.crewScheduleEnd.value = "15:30";
+  els.crewScheduleDialog.hidden = false;
+  els.crewScheduleStart.focus();
+}
+
+function closeCrewScheduleDialog() {
+  pendingCrewScheduleShiftId = null;
+  pendingCrewScheduleLunch = "";
+  els.crewScheduleDialog.hidden = true;
+  els.crewScheduleSubmitButton.disabled = false;
+  els.crewScheduleSkipButton.disabled = false;
+}
+
+async function submitCrewScheduleClockOut() {
+  const current = currentActiveShift();
+  if (!current || current.id !== pendingCrewScheduleShiftId) {
+    closeCrewScheduleDialog();
+    return;
+  }
+  const schedule = buildCrewScheduleReport(current);
+  if (!schedule) return;
+  els.crewScheduleSubmitButton.disabled = true;
+  els.crewScheduleSkipButton.disabled = true;
+  await completeClockOut(current, pendingCrewScheduleLunch, schedule);
+}
+
+async function skipCrewScheduleClockOut() {
+  const current = currentActiveShift();
+  if (!current || current.id !== pendingCrewScheduleShiftId) {
+    closeCrewScheduleDialog();
+    return;
+  }
+  els.crewScheduleSubmitButton.disabled = true;
+  els.crewScheduleSkipButton.disabled = true;
+  await completeClockOut(current, pendingCrewScheduleLunch, null);
+}
+
+function buildCrewScheduleReport(shift) {
+  const scheduledStart = normalizeTimeInput(els.crewScheduleStart.value);
+  const scheduledEnd = normalizeTimeInput(els.crewScheduleEnd.value);
+  if (!scheduledStart || !scheduledEnd) {
+    showToast("Enter the crew schedule start and end.");
+    return null;
+  }
+  if (scheduledStart === scheduledEnd) {
+    showToast("Scheduled start and end cannot be the same.");
+    return null;
+  }
+  return {
+    id: `schedule-${newId()}`,
+    worker: currentWorker(),
+    role: currentRole(),
+    date: localDateKey(new Date(shift.start)),
+    jobsite: shift.jobsite,
+    scheduledStart,
+    scheduledEnd,
+    reportedAt: new Date().toISOString(),
+    source: "Foreman",
+    sourceSessionId: shift.id,
+    deviceId: state.deviceId || "",
+  };
+}
+
+function normalizeTimeInput(value) {
+  const text = String(value || "").trim();
+  if (!/^\d{2}:\d{2}$/.test(text)) return "";
+  const [hours, minutes] = text.split(":").map(Number);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours > 23 || minutes > 59) return "";
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
 function openSwitchDialog() {
@@ -975,6 +1092,9 @@ async function saveCompletedShift(shift) {
     await loadMyHours({ quiet: true, renderBefore: false, renderAfter: false });
     saveState();
     setConnection("ready", "Saved to Payroll 2.0");
+    if (shift.crewScheduleId) {
+      await saveCrewScheduleReportForShift(shift, data.submissionId);
+    }
     return { ok: true, data };
   } catch (error) {
     if (isSessionExpiredError(error)) {
@@ -1042,6 +1162,73 @@ async function notifySaveProblem(shift, error) {
   }
 }
 
+function queueCrewScheduleReport(report) {
+  state.scheduleReports = state.scheduleReports.filter((item) => item.id !== report.id);
+  state.scheduleReports.unshift(report);
+}
+
+function crewScheduleReportForShift(shiftId) {
+  return state.scheduleReports.find((report) => report.linkedShiftId === shiftId) || null;
+}
+
+function updateCrewScheduleSync(id, patch) {
+  state.scheduleReports = state.scheduleReports.map((report) => (report.id === id ? { ...report, ...patch } : report));
+  saveState();
+}
+
+async function saveCrewScheduleReportForShift(shift, submissionId) {
+  const report = crewScheduleReportForShift(shift.id);
+  if (!report || report.syncStatus === "saved") return { ok: true };
+  updateCrewScheduleSync(report.id, { syncStatus: "pending", error: "" });
+  try {
+    const data = await apiPost("saveCrewScheduleReport", {
+      token: state.auth?.token,
+      report: toCrewSchedulePayload(report, shift, submissionId || shift.submissionId || ""),
+    });
+    updateCrewScheduleSync(report.id, {
+      syncStatus: "saved",
+      savedAt: new Date().toISOString(),
+      row: data.row || "",
+      error: "",
+    });
+    state.lastSync = "Clock out and crew schedule saved";
+    saveState();
+    setConnection("ready", "Crew schedule saved");
+    return { ok: true, data };
+  } catch (error) {
+    updateCrewScheduleSync(report.id, {
+      syncStatus: "failed",
+      error: error.message || "Crew schedule not synced.",
+    });
+    state.lastSync = "Clock out saved. Crew schedule not synced.";
+    saveState();
+    setConnection("error", "Clock out saved. Crew schedule not synced.");
+    showToast("Clock out saved. Crew schedule not synced. Retry Saves.");
+    return { ok: false, error };
+  } finally {
+    render();
+  }
+}
+
+function toCrewSchedulePayload(report, shift, submissionId) {
+  return {
+    scheduleId: report.id,
+    date: report.date,
+    jobsite: report.jobsite,
+    scheduledStart: report.scheduledStart,
+    scheduledEnd: report.scheduledEnd,
+    reportedBy: report.worker,
+    reportedRole: report.role,
+    reportedAt: report.reportedAt,
+    source: report.source || "Foreman",
+    sourceSessionId: report.sourceSessionId || shift.id,
+    sourceSubmissionId: submissionId || "",
+    deviceId: report.deviceId || state.deviceId || "",
+    shiftStartIso: report.shiftStartIso || shift.start || "",
+    shiftEndIso: report.shiftEndIso || shift.end || "",
+  };
+}
+
 function isSessionExpiredError(error) {
   return /session expired/i.test(error?.message || "");
 }
@@ -1069,9 +1256,14 @@ function updateShiftSync(id, patch) {
 
 async function retryFailedSaves() {
   const failed = state.shifts.filter((shift) => shift.syncStatus === "failed");
-  if (!failed.length) return showToast("No failed saves");
+  const failedSchedules = state.scheduleReports.filter((report) => report.syncStatus === "failed" || report.syncStatus === "waiting");
+  if (!failed.length && !failedSchedules.length) return showToast("No failed saves");
   for (const shift of failed) {
     await saveCompletedShift(shift);
+  }
+  for (const report of failedSchedules) {
+    const shift = state.shifts.find((item) => item.id === report.linkedShiftId && item.syncStatus === "saved");
+    if (shift) await saveCrewScheduleReportForShift(shift, shift.submissionId || "");
   }
 }
 
@@ -1519,6 +1711,7 @@ function renderCompletedRows(rows) {
               <span class="entry-sub">${timeLabel(shift.start)} - ${timeLabel(shift.end)}</span>
               <span class="entry-sub">Lunch: ${escapeHtml(shift.lunch)}</span>
               ${travel ? `<span class="entry-sub">${escapeHtml(travel)}</span>` : ""}
+              ${crewScheduleStatusLabel(shift) ? `<span class="entry-sub">${escapeHtml(crewScheduleStatusLabel(shift))}</span>` : ""}
               ${shift.error ? `<span class="entry-sub">Save error: ${escapeHtml(shift.error)}</span>` : ""}
             </div>
             <span class="mini-pill ${syncClass(shift)}">${syncLabel(shift)}</span>
@@ -1951,6 +2144,7 @@ function alertGroupsSignature(groups) {
 function buildAlertSections() {
   const failed = state.shifts.filter((shift) => shift.syncStatus === "failed");
   const pending = state.shifts.filter((shift) => shift.syncStatus === "pending");
+  const scheduleProblems = state.scheduleReports.filter((report) => report.syncStatus === "failed" || report.syncStatus === "pending");
   const absentWorkers = new Set(payroll.absences
     .filter((entry) => entry.date === todayKey() && entry.status === "Absent")
     .map((entry) => entry.worker));
@@ -2002,6 +2196,12 @@ function buildAlertSections() {
           statusClass: shift.syncStatus === "pending" ? "pending" : "failed",
           detail: shift.error || (shift.syncStatus === "pending" ? "Waiting to save" : "Save failed, try again"),
         }))
+        .concat(scheduleProblems.map((report) => ({
+          worker: report.worker,
+          status: report.syncStatus === "pending" ? "Crew Schedule Pending" : "Crew Schedule Failed",
+          statusClass: report.syncStatus === "pending" ? "pending" : "failed",
+          detail: report.error || `${report.jobsite} schedule not synced`,
+        })))
         .sort(compareAlertPeople),
     },
     {
@@ -2176,9 +2376,22 @@ function syncStatusText() {
   const rows = completedRowsFor();
   const failed = rows.filter((shift) => shift.syncStatus === "failed").length;
   const pending = rows.filter((shift) => shift.syncStatus === "pending").length;
+  const scheduleFailed = state.scheduleReports.filter((report) => report.syncStatus === "failed").length;
+  const schedulePending = state.scheduleReports.filter((report) => report.syncStatus === "pending").length;
   if (failed) return "Save failed, try again";
+  if (scheduleFailed) return "Clock out saved. Crew schedule not synced.";
   if (pending) return "Saving";
+  if (schedulePending) return "Saving crew schedule";
   return state.lastSync || "Ready";
+}
+
+function crewScheduleStatusLabel(shift) {
+  const report = shift.crewScheduleId ? state.scheduleReports.find((item) => item.id === shift.crewScheduleId) : null;
+  if (!report) return "";
+  if (report.syncStatus === "saved") return "Crew schedule saved";
+  if (report.syncStatus === "failed") return `Crew schedule not synced: ${report.error || "Retry Saves"}`;
+  if (report.syncStatus === "pending" || report.syncStatus === "waiting") return "Crew schedule pending";
+  return "";
 }
 
 function summarize(shifts) {

@@ -273,6 +273,37 @@
       </section>
     </div>
 
+    <div class="modal-backdrop" id="crewScheduleDialog" hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="crewScheduleTitle">
+        <div class="modal-icon schedule" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <rect x="4" y="5" width="16" height="15" rx="2" />
+            <path d="M8 3v4" />
+            <path d="M16 3v4" />
+            <path d="M4 10h16" />
+            <path d="M8 14h3" />
+            <path d="M13 14h3" />
+          </svg>
+        </div>
+        <h2 id="crewScheduleTitle">Crew Schedule</h2>
+        <p id="crewScheduleContext">What was the crew's scheduled shift today?</p>
+        <div class="schedule-time-grid">
+          <label class="modal-field">
+            Scheduled Start
+            <input id="crewScheduleStart" type="time" value="07:00" />
+          </label>
+          <label class="modal-field">
+            Scheduled End
+            <input id="crewScheduleEnd" type="time" value="15:30" />
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button" id="crewScheduleSkipButton" type="button">Save Clock Out Only</button>
+          <button class="primary-button" id="crewScheduleSubmitButton" type="button">Complete Clock Out</button>
+        </div>
+      </section>
+    </div>
+
     <div class="modal-backdrop" id="absentDialog" hidden>
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="absentTitle">
         <h2 id="absentTitle">Mark yourself absent for today?</h2>

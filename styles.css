@@ -1325,6 +1325,11 @@ textarea {
   color: var(--teal-dark);
 }
 
+.modal-icon.schedule {
+  background: #eef4ff;
+  color: #1d4ed8;
+}
+
 .modal h2 {
   margin-top: 12px;
   font-size: 22px;
@@ -1340,6 +1345,25 @@ textarea {
 
 .modal-field {
   margin-top: 14px;
+}
+
+.schedule-time-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.schedule-time-grid input {
+  min-height: 56px;
+  width: 100%;
+  margin-top: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 22px;
+  font-weight: 760;
 }
 
 #switchDialog select {
