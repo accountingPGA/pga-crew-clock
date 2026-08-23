@@ -11,6 +11,7 @@ const API_PLACEHOLDER = "PASTE_APPS_SCRIPT_WEB_APP_URL_HERE";
 const VAPID_PLACEHOLDER = "PASTE_WEB_PUSH_VAPID_PUBLIC_KEY_HERE";
 const APP_TIME_ZONE = "America/Vancouver";
 const OPERATIONS_REFRESH_MS = 30000;
+const MY_HOURS_REFRESH_THROTTLE_MS = 3000;
 const STILL_CLOCKED_IN_ALERT_TIME = "17:30";
 const SESSION_EXPIRED_SAVE_MESSAGE = "Your session expired. Please sign in again. Your shift is still saved on this phone.";
 const FIREBASE_SDK_VERSION = "10.13.2";
@@ -128,6 +129,8 @@ let toastTimer;
 let renderTimer;
 let operationsRefreshTimer;
 let bootstrapLoading = false;
+let myHoursRequestPromise = null;
+let lastMyHoursRefreshStartedAt = 0;
 let serviceWorkerRegistration = null;
 
 function defaultState() {
@@ -224,6 +227,10 @@ function setup() {
     if (key) handlePinKey(key);
   });
   window.addEventListener("keydown", handleKeyboardPin);
+  window.addEventListener("focus", refreshMyHoursFromAppResume);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshMyHoursFromAppResume();
+  });
   els.logoutButton.addEventListener("click", logout);
   els.refreshButton.addEventListener("click", loadBootstrap);
   els.siteSelect.addEventListener("change", () => {
@@ -304,6 +311,7 @@ async function loginWithPin() {
   setLoginMessage("Checking PIN...");
   try {
     const data = await apiPost("login", { pin: pinBuffer });
+    resetMyHoursState();
     state.auth = {
       token: data.token,
       worker: data.employee.worker,
@@ -378,24 +386,58 @@ async function loadBootstrap(options = {}) {
 
 async function loadMyHours(options = {}) {
   if (!state.auth || !apiReady()) return;
-  payroll.myHoursLoading = true;
-  if (options.renderBefore !== false && state.activeTab === "myHours") render();
+  if (myHoursRequestPromise) return myHoursRequestPromise;
+  const requestToken = state.auth.token;
+  lastMyHoursRefreshStartedAt = Date.now();
+  myHoursRequestPromise = (async () => {
+    payroll.myHoursLoading = true;
+    if (options.renderBefore !== false && state.activeTab === "myHours") render();
+    try {
+      const data = await apiPost("myHours", { token: requestToken });
+      if (!state.auth || state.auth.token !== requestToken) return;
+      payroll.myHours = arrayOrEmpty(data.rows);
+      payroll.myHoursSummary = data.payrollSummary || null;
+      payroll.myHoursMessage = data.message || "";
+      payroll.payrollPeriod = data.payrollPeriod || payroll.payrollPeriod || {};
+      if (state.auth && data.workerType) state.auth.workerType = normalizeWorkerType(data.workerType);
+      payroll.myHoursLoadedAt = new Date().toISOString();
+    } catch (error) {
+      payroll.myHours = [];
+      payroll.myHoursSummary = null;
+      payroll.myHoursMessage = error.message || "Could not load My Hours.";
+    } finally {
+      payroll.myHoursLoading = false;
+      if (options.renderAfter !== false && state.activeTab === "myHours") render();
+    }
+  })();
   try {
-    const data = await apiPost("myHours", { token: state.auth.token });
-    payroll.myHours = arrayOrEmpty(data.rows);
-    payroll.myHoursSummary = data.payrollSummary || null;
-    payroll.myHoursMessage = data.message || "";
-    payroll.payrollPeriod = data.payrollPeriod || payroll.payrollPeriod || {};
-    if (state.auth && data.workerType) state.auth.workerType = normalizeWorkerType(data.workerType);
-    payroll.myHoursLoadedAt = new Date().toISOString();
-  } catch (error) {
-    payroll.myHours = [];
-    payroll.myHoursSummary = null;
-    payroll.myHoursMessage = error.message || "Could not load My Hours.";
+    return await myHoursRequestPromise;
   } finally {
-    payroll.myHoursLoading = false;
-    if (options.renderAfter !== false && state.activeTab === "myHours") render();
+    myHoursRequestPromise = null;
   }
+}
+
+function requestMyHoursRefresh(options = {}) {
+  if (!state.auth || !apiReady()) return Promise.resolve();
+  if (myHoursRequestPromise) return myHoursRequestPromise;
+  const now = Date.now();
+  if (!options.force && now - lastMyHoursRefreshStartedAt < MY_HOURS_REFRESH_THROTTLE_MS) {
+    return Promise.resolve();
+  }
+  return loadMyHours(options);
+}
+
+function refreshMyHoursFromAppResume() {
+  if (!state.auth || state.activeTab !== "myHours" || document.hidden) return;
+  requestMyHoursRefresh({ quiet: true });
+}
+
+function resetMyHoursState() {
+  payroll.myHours = [];
+  payroll.myHoursSummary = null;
+  payroll.myHoursMessage = "";
+  payroll.myHoursLoadedAt = null;
+  payroll.myHoursLoading = false;
 }
 
 function refreshOperationsIfOpen() {
@@ -417,6 +459,7 @@ function showApp() {
 }
 
 function logout() {
+  resetMyHoursState();
   state.auth = null;
   state.activeTab = "clock";
   saveState();
@@ -429,7 +472,7 @@ function setActiveTab(tab) {
   saveState();
   render();
   if (tab === "operations" || tab === "alerts") loadBootstrap({ quiet: true });
-  if (tab === "myHours") loadMyHours({ quiet: true });
+  if (tab === "myHours") requestMyHoursRefresh({ quiet: true, force: true });
 }
 
 function currentWorker() {
@@ -1564,6 +1607,7 @@ function renderMyHours() {
   els.myHoursPeriod.innerHTML = `
     <span>Current Payroll Period</span>
     <strong>${escapeHtml(dateLabel(period.start))} &ndash; ${escapeHtml(dateLabel(period.end))}</strong>
+    ${renderMyHoursRefreshedAt()}
   `;
   const rows = myHoursRowsForDisplay();
   const summaryCards = renderMyHoursSummaryCards();
@@ -1586,6 +1630,11 @@ function renderMyHours() {
     </div>
     ${summaryCards}
   `;
+}
+
+function renderMyHoursRefreshedAt() {
+  if (!payroll.myHoursLoadedAt) return "";
+  return `<span class="my-hours-refreshed">Last refreshed ${escapeHtml(timeLabel(payroll.myHoursLoadedAt))}</span>`;
 }
 
 function renderMyHoursSummaryCards() {

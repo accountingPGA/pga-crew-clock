@@ -857,6 +857,13 @@ textarea {
   font-weight: 820;
 }
 
+.my-hours-refreshed {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+  text-transform: none;
+}
+
 .my-hours-table {
   overflow: hidden;
   border: 1px solid var(--line);
