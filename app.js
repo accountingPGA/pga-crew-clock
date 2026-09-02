@@ -1642,11 +1642,19 @@ function renderMyHoursSummaryCards() {
   const workerType = normalizeWorkerType(summary.workerType || currentWorkerType());
   const pending = summary.status !== "ready";
   const cards = workerType === "Subcontractor"
-    ? [{ label: "Total Hours", value: summary.totalHours }]
+    ? [
+        { label: "Regular Hours", value: summary.regularHours },
+        { label: "Swing Stage Hours", value: summary.swingStageHours },
+      ]
     : [
         { label: "Regular Hours", value: summary.regularHours },
         { label: "OT Hours", value: summary.otHours },
+        { label: "Swing Stage Hours", value: summary.swingStageHours },
       ];
+  const doubleTimeHours = Number(summary.doubleTimeHours);
+  if (Number.isFinite(doubleTimeHours) && doubleTimeHours > 0) {
+    cards.push({ label: "Double Time Hours", value: summary.doubleTimeHours });
+  }
 
   return `
     <section class="my-hours-summary-cards" aria-label="Payroll summary">
