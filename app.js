@@ -191,7 +191,7 @@ async function apiGet(action) {
   const url = new URL(CONFIG.apiUrl);
   url.searchParams.set("action", action);
   url.searchParams.set("_", Date.now().toString());
-  const response = await fetch(url.toString(), { method: "GET" });
+  const response = await apiFetch(url.toString(), { method: "GET" });
   return parseApiResponse(response);
 }
 
@@ -199,11 +199,22 @@ async function apiPost(action, payload = {}) {
   if (!apiReady()) throw new Error("Add the Apps Script Web App URL in index.html.");
   const body = new URLSearchParams();
   body.set("payload", JSON.stringify({ action, ...payload }));
-  const response = await fetch(CONFIG.apiUrl, {
+  const response = await apiFetch(CONFIG.apiUrl, {
     method: "POST",
     body,
   });
   return parseApiResponse(response);
+}
+
+async function apiFetch(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (error) {
+    const networkError = new Error("Network/offline connection failure. Your save is still kept on this device for retry.");
+    networkError.isNetworkError = true;
+    networkError.originalMessage = error?.message || "";
+    throw networkError;
+  }
 }
 
 async function parseApiResponse(response) {
@@ -213,7 +224,12 @@ async function parseApiResponse(response) {
   } catch {
     throw new Error("Payroll 2.0 returned an unreadable response.");
   }
-  if (data.ok === false) throw new Error(data.error || "Payroll 2.0 request failed.");
+  if (data.ok === false) {
+    const error = new Error(data.error || "Payroll 2.0 request failed.");
+    error.isBackendError = true;
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -1128,15 +1144,22 @@ async function saveCompletedShift(shift) {
       handleExpiredSessionSave(shift);
       return { ok: false, error };
     }
-    updateShiftSync(shift.id, { syncStatus: "failed", error: error.message });
+    const message = saveErrorMessage(error, "Save failed, try again");
+    updateShiftSync(shift.id, { syncStatus: "failed", error: message });
     await notifySaveProblem(shift, error);
-    state.lastSync = "Save failed, try again";
+    state.lastSync = message;
     saveState();
-    setConnection("error", "Save failed, try again");
+    setConnection("error", message);
     return { ok: false, error };
   } finally {
     render();
   }
+}
+
+function saveErrorMessage(error, fallback) {
+  if (error?.isNetworkError) return error.message;
+  if (error?.isBackendError) return `Payroll 2.0 error: ${error.message}`;
+  return error?.message || fallback;
 }
 
 function applyCompletedShiftSideEffects(shift) {
@@ -1582,7 +1605,9 @@ function clockConnectionStatus() {
     return { state: "connecting", text: "🟡 Connecting...", className: "connecting" };
   }
   if (state.lastSync === "Connection failed" || els.connectionBar.classList.contains("error")) {
-    return { state: "offline", text: "🔴 Offline", className: "problem" };
+    const detail = els.connectionBar.dataset.detail || state.lastSync || "";
+    const offline = /network|offline|failed to fetch|load failed|connection failed/i.test(detail);
+    return { state: offline ? "offline" : "attention", text: offline ? "🔴 Offline" : "🔴 Needs attention", className: "problem" };
   }
   if (!payroll.loadedAt) {
     return { state: "connecting", text: "🟡 Connecting...", className: "connecting" };
@@ -2554,11 +2579,17 @@ function setConnection(mode, message) {
   const statusText = mode === "ready"
     ? "Connected to Payroll 2.0"
     : mode === "error"
-      ? "Lost connection to Payroll 2.0"
+      ? connectionErrorTitle(message)
       : "Connecting to Payroll 2.0";
   els.connectionText.textContent = statusText;
   els.connectionBar.dataset.detail = message || "";
   els.connectionBar.setAttribute("aria-label", message ? `${statusText}: ${message}` : statusText);
+}
+
+function connectionErrorTitle(message) {
+  const text = String(message || "");
+  if (/network|offline|failed to fetch|load failed|connection failed/i.test(text)) return "Lost connection to Payroll 2.0";
+  return "Payroll 2.0 needs attention";
 }
 
 function setLoginMessage(message, isError = false) {
