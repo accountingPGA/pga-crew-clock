@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-attendance-wording-20261030";
+const APP_REVISION_V30 = "pga-crew-clock-v30-notification-reregister-20261030";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -2109,9 +2109,10 @@ function renderReminderPanel() {
   const canEnable = canEnableDeviceNotifications();
   const permission = "Notification" in window ? Notification.permission : "unsupported";
   const enabled = permission === "granted" && !!state.notificationEndpoint;
-  const canRequestPermission = canEnable && permission === "default";
+  const canRegister = canEnable && (permission === "default" || permission === "granted");
   els.reminderPanel.hidden = true;
-  els.notificationButton.hidden = !canRequestPermission;
+  els.notificationButton.hidden = !canRegister;
+  els.notificationButton.textContent = permission === "granted" ? "🔔 RE-REGISTER NOTIFICATIONS" : "🔔 ENABLE NOTIFICATIONS";
   els.notificationButton.disabled = false;
   if (!canEnable) return;
 
