@@ -1534,3 +1534,10 @@ textarea {
 }
 
 .vacation-dates{display:block;font-size:.78rem;white-space:normal;overflow-wrap:anywhere}.mini-pill.vacation{background:#eee8f7;color:#553282}.vacation-conflict{background:#fff1db;color:#7a4300}.vacation-notice{padding:.75rem;border:1px solid #b78328;border-radius:.5rem;font-size:.85rem}
+
+/* Conditional, compact notices; no sync or recovery controls are hidden. */
+.jobsite-group-header strong:has(.vacation-data-indicator){white-space:normal}
+.vacation-data-indicator{display:inline-block;margin-left:.55rem;color:var(--muted);font-size:.72rem;font-weight:400;vertical-align:middle}
+.app-update-notice{margin:12px auto;padding:10px 14px;max-width:720px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.app-update-notice p{margin:0 0 6px;font-size:.85rem}
+.vacation-notice{padding:.35rem 0;border:0;font-size:.8rem;color:var(--muted)}

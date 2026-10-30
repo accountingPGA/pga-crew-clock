@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-vacation-b-20261029";
+const APP_REVISION_V30 = "pga-crew-clock-v30-ui-cleanup-20261030";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -402,6 +402,7 @@ let operationsRefreshTimer;
 let bootstrapLoading = false;
 let bootstrapRequestToken = null;
 let bootstrapRequestOwner = null;
+let bootstrapRequestPromise = null;
 let switchShiftProof = null;
 let loginRequestOwner = null;
 let myHoursRequestPromise = null;
@@ -643,12 +644,19 @@ async function loginWithPin() {
   } finally {if(loginRequestOwner===owner)loginRequestOwner=null;}
 }
 
-async function loadBootstrap(options = {}) {
+function loadBootstrap(options = {}) {
+  // All same-session callers await the same read; a previous sign-in cannot own a new one.
+  if (bootstrapRequestPromise && bootstrapRequestToken === state.auth?.token) return bootstrapRequestPromise;
+  const request = performBootstrapV30(options);
+  bootstrapRequestPromise = request;
+  return request;
+}
+
+async function performBootstrapV30(options = {}) {
   if(!state.auth||!apiReady())return;
   if (authExpiredV30()) { recoveryFailureV30(new Error("Session expired. Sign in again.")); setConnection("error", "Renew sign-in. Local records retained."); return; }
   const requestToken=state.auth.token,requestWorker=currentWorker(),owner={quiet:options.quiet===true};
   const sameEmployee=()=>state.auth?.token===requestToken&&currentWorker()===requestWorker;
-  if(bootstrapLoading&&bootstrapRequestToken===requestToken)return;
   bootstrapRequestToken=requestToken;bootstrapRequestOwner=owner;
   bootstrapLoading = true;
   markOperationsReadV30("loading",requestWorker,requestToken);
@@ -711,7 +719,7 @@ async function loadBootstrap(options = {}) {
     recoveryFailureV30(error);
     setConnection("error", error.message);
   } finally {
-    if(bootstrapRequestOwner===owner){bootstrapLoading=false;bootstrapRequestToken=null;bootstrapRequestOwner=null;}
+    if(bootstrapRequestOwner===owner){bootstrapLoading=false;bootstrapRequestToken=null;bootstrapRequestOwner=null;bootstrapRequestPromise=null;}
     if(sameEmployee())render();
   }
 }
@@ -793,9 +801,13 @@ function resetMyHoursState() {
 }
 
 function refreshOperationsIfOpen() {
-  if (state.auth && canUseOperations() && state.activeTab === "operations") {
-    loadBootstrap({ quiet: true });
-  }
+  if (document.hidden || navigator.onLine === false || !offlineReady || offlineError || localCaptureBusy
+      || !state.auth || authExpiredV30() || recoveryV30.renewalWorker) return;
+  const managerView = canUseOperations() && ["operations", "alerts"].includes(state.activeTab);
+  const connectionDue = recoveryV30.token !== state.auth.token || !!recoveryV30.error
+    || Date.now() - recoveryV30.verifiedAt >= OPERATIONS_REFRESH_MS;
+  // Reuse the existing 30-second timer; never relax the 90-second verification guard.
+  if (managerView || connectionDue) void loadBootstrap({ quiet: true });
 }
 
 function showLogin(message) {
@@ -2143,11 +2155,9 @@ function renderOperations() {
   els.teamHours.textContent = durationLabel(totalHours);
 
   const groups = buildOperationsGroups(absentWorkers);
-  const vacationNotice = crewVacationNotice();
   els.teamList.innerHTML = groups.length
     ? groups.map(renderOperationsGroup).join("")
     : `<p class="empty-state">No clocked-in, clocked-out, or absent employees today</p>`;
-  els.teamList.innerHTML = vacationNotice + els.teamList.innerHTML;
   bindTransferExpansionState();
 }
 
@@ -2202,7 +2212,7 @@ function operationsHourSegments() {
 
 function buildOperationsGroups(absentWorkers) {
   const groups = new Map();
-  const vacationGroup = {jobsite: "Vacation", colour: "#7353a6", people: []};
+  const vacationGroup = {jobsite: "Vacation", colour: "#7353a6", people: [], isVacation: true};
   const absentGroup = {
     jobsite: "Absent Today",
     colour: "#b42318",
@@ -2270,7 +2280,7 @@ function buildOperationsGroups(absentWorkers) {
     .filter((group) => group.people.length)
     .sort((a, b) => a.jobsite.localeCompare(b.jobsite));
 
-  if (vacationGroup.people.length) jobsiteGroups.push(vacationGroup);
+  if (vacationGroup.people.length || crewVacationIndicatorV30()) jobsiteGroups.push(vacationGroup);
   if (absentGroup.people.length) jobsiteGroups.push(absentGroup);
   return jobsiteGroups;
 }
@@ -2281,7 +2291,7 @@ function renderOperationsGroup(group) {
     <section class="jobsite-group" style="--row-site-color:${colour}">
       <header class="jobsite-group-header">
         <span class="jobsite-colour" aria-hidden="true"></span>
-        <strong>${escapeHtml(group.jobsite)}</strong>
+        <strong>${escapeHtml(group.jobsite)}${group.isVacation && crewVacationIndicatorV30() ? `<small class="vacation-data-indicator" role="status">${escapeHtml(crewVacationIndicatorV30())}</small>` : ""}</strong>
         <span>${group.people.length}</span>
       </header>
       <div class="jobsite-crew">
@@ -3284,16 +3294,13 @@ function operationsFreshnessV30() {
   const read = operationsReadV30;
   const same = read.worker === currentWorker() && read.token === state.auth?.token;
   const hasComplete = same && !!read.loadedAt && read.day === todayKey();
-  const offline = navigator.onLine === false;
-  let status = "unavailable", message;
-  const last = hasComplete ? new Intl.DateTimeFormat([], {dateStyle:"medium",timeStyle:"medium",timeZone:APP_TIME_ZONE}).format(new Date(read.loadedAt)) : "Never";
-  if (offline) { status = "stale"; message = hasComplete ? "Offline — showing the last complete team data." : "Offline — complete team data is unavailable. Local employee records are not team totals."; }
-  else if (same && read.loading) { status = "loading"; message = hasComplete ? "Refreshing Operations — showing the last complete team data." : "Loading complete team data…"; }
-  else if (same && read.error) { status = "error"; message = hasComplete ? "Operations refresh failed — showing stale team data. Automatic retry is enabled." : "Operations could not load complete team data. Automatic retry is enabled."; }
-  else if (hasComplete && Date.now() - Date.parse(read.loadedAt) <= OPERATIONS_REFRESH_MS * 2) { status = "current"; message = "Operations refreshed successfully."; }
-  else if (hasComplete) { status = "stale"; message = "Team data is stale — waiting for the next successful refresh."; }
-  else message = "Complete team data is unavailable. Refresh Operations to try again.";
-  return {status,hasComplete,lastSuccessfulAt:hasComplete?read.loadedAt:null,message:message+" Last successful refresh: "+last+"."};
+  let status = "unavailable", message = "Team data unavailable. Try Refresh.";
+  if (navigator.onLine === false) { status = "stale"; message = hasComplete ? "Offline — showing saved team data." : "Offline — team data unavailable."; }
+  else if (same && read.loading) { status = "loading"; message = "Refreshing…"; }
+  else if (same && read.error) { status = "error"; message = hasComplete ? "Couldn’t refresh. Showing saved team data." : "Couldn’t load team data. Try Refresh."; }
+  else if (hasComplete && Date.now() - Date.parse(read.loadedAt) <= OPERATIONS_REFRESH_MS * 2) { status = "current"; message = ""; }
+  else if (hasComplete) { status = "stale"; message = "Team data may be outdated."; }
+  return {status,hasComplete,lastSuccessfulAt:hasComplete?read.loadedAt:null,message};
 }
 function renderOperationsFreshnessV30() {
   const view = operationsFreshnessV30();
@@ -3303,7 +3310,8 @@ function renderOperationsFreshnessV30() {
     panel.setAttribute("role","status");panel.setAttribute("aria-live","polite");panel.className="muted";
     document.querySelector("#operationsView .team-head").after(panel);
   }
-  panel.textContent = view.message;panel.dataset.status = view.status;
+  panel.textContent = view.message;panel.dataset.status = view.status;panel.hidden = view.status === "current";
+  panel.dataset.lastSuccessfulAt = view.lastSuccessfulAt || "";panel.dataset.detail = operationsReadV30.error || "";
   document.querySelector("#operationsView").setAttribute("aria-busy",view.status === "loading" ? "true" : "false");
   if (els.refreshButton) els.refreshButton.disabled = view.status === "loading";
   return view;
@@ -3312,18 +3320,17 @@ function renderOperationsFreshnessV30() {
 /* Update UI only. No payroll writes, storage migration, cache deletion or automatic reload. */
 const CrewClockUpdatesV30 = (() => {
   function create({registration, readProtection, online, reload, freeze, document: doc = document, events = window}) {
-    let checking = null, applying = false, available = !!registration.waiting;
+    let checking = null, applying = false, available = !!registration.waiting, checkError = "";
     const originalWorker=registration.active;
-    const panel=doc.createElement('section');panel.id='appUpdatePanel';panel.setAttribute('aria-label','App update');
+    const panel=doc.createElement('section');panel.id='appUpdatePanel';panel.className='app-update-notice';panel.hidden=true;panel.setAttribute('aria-label','App update');
     const message=doc.createElement('p');message.setAttribute('role','status');message.setAttribute('aria-live','polite');
-    const check=doc.createElement('button');check.type='button';check.textContent='Check for updates';
-    const apply=doc.createElement('button');apply.type='button';apply.textContent='Update ready — open updated app';apply.hidden=true;
-    const version=doc.createElement('p');version.textContent='Crew Clock V30 · Recovery 1';panel.append(version,message,check,apply);doc.body.append(panel);
+    const apply=doc.createElement('button');apply.type='button';apply.textContent='Update app';apply.className='text-button';apply.hidden=true;
+    panel.append(message,apply);doc.body.append(panel);
     async function protection(){try{return await readProtection() || '';}catch{return 'Local storage could not be verified. Update deferred; existing records are retained.';}}
-    async function paint(){available=available||!!registration.waiting||!!(originalWorker&&registration.active&&registration.active!==originalWorker);apply.hidden=!available;const reason=await protection();apply.disabled=applying||!!reason||!online();check.disabled=applying;message.textContent=available?('Update ready. '+(reason||(!online()?'Reconnect before updating.':'Tap to update when you are ready. Your saved records will be retained.'))):'App update checks preserve your existing records.';}
+    async function paint(){available=available||!!registration.waiting||!!(originalWorker&&registration.active&&registration.active!==originalWorker);apply.hidden=!available;const reason=await protection();apply.disabled=applying||!!reason||!online();panel.hidden=!available&&!checkError;message.textContent=available?('Update available. '+(reason||(!online()?'Reconnect before updating.':'Open when ready; records are retained.'))):checkError;}
     function observe(worker){if(!worker)return;worker.addEventListener('statechange',()=>{if(originalWorker&&worker!==originalWorker&&['installed','activating','activated'].includes(worker.state)){available=true;void paint();}});}
     registration.addEventListener('updatefound',()=>observe(registration.installing));observe(registration.installing);
-    async function checkNow(){if(!online()||checking||applying)return checking;checking=(async()=>{try{message.textContent='Checking for app updates…';await registration.update();await paint();if(!available)message.textContent=registration.installing?'Downloading app update. Your current app and records remain available.':'No update is waiting. Checks will run again when you reopen or reconnect.';}catch{message.textContent='Update check failed. Your current app and records are retained. Try again online.';}finally{checking=null;}})();return checking;}
+    async function checkNow(){if(!online()||checking||applying)return checking;checking=(async()=>{try{await registration.update();checkError='';await paint();}catch{checkError='Couldn’t check for updates. Reconnect to retry; records retained.';await paint();}finally{checking=null;}})();return checking;}
     async function applyNow(){if(applying||!available||!online())return;applying=true;freeze(true);
       try{
         let reason=await protection();if(reason)throw Error(reason);
@@ -3336,7 +3343,7 @@ const CrewClockUpdatesV30 = (() => {
       }catch(error){message.textContent='Update deferred. '+error.message;}
       finally{applying=false;freeze(false);apply.disabled=false;}
     }
-    check.addEventListener('click',()=>void checkNow());apply.addEventListener('click',()=>void applyNow());
+    apply.addEventListener('click',()=>void applyNow());
     events.addEventListener('focus',()=>void checkNow());events.addEventListener('online',()=>void checkNow());events.addEventListener('pageshow',()=>void checkNow());
     doc.addEventListener('visibilitychange',()=>{if(!doc.hidden)void checkNow();});
     events.navigator?.serviceWorker?.addEventListener('controllerchange',()=>{available=available||!!registration.waiting||!!(originalWorker&&registration.active!==originalWorker);void paint();});
@@ -3461,9 +3468,18 @@ function crewVacationHasWork(worker) {
     || payroll.submissions.some(s => s.worker === worker && s.date === todayKey())
     || payroll.clockStates.some(s => s.worker === worker && s.date === todayKey() && ["Clocked In","Clocked Out"].includes(s.status));
 }
+function crewVacationIndicatorV30() {
+  const view = payroll.vacations, read = operationsReadV30;
+  const retained = view?.date === todayKey() && !!view?.lastSuccessfulAt;
+  const same = read.worker === currentWorker() && read.token === state.auth?.token;
+  const fresh = retained && view.status === "available" && same && read.day === todayKey()
+    && !!read.loadedAt && !read.error && navigator.onLine !== false
+    && Date.now() - Date.parse(read.loadedAt) <= OPERATIONS_REFRESH_MS * 2;
+  if (fresh) return ""; // An ordinary in-flight refresh does not invalidate the saved read.
+  if (!retained && same && read.loading && !read.loadedAt) return "";
+  return retained ? "Vacation data may be outdated" : "Vacation information unavailable";
+}
 function crewVacationNotice() {
-  const view = payroll.vacations, fresh = crewVacationAlertsAvailable();
-  if (fresh) return "";
-  const retained = view?.date === todayKey() && view?.lastSuccessfulAt;
-  return `<p class="vacation-notice" role="status">${retained ? "Vacation data is stale — showing the last successful vacation read." : "Vacation data is unavailable."} Vacation-related missing-attendance decisions are paused until a fresh read succeeds.</p>`;
+  const indicator = crewVacationIndicatorV30();
+  return indicator ? `<p class="vacation-notice" role="status">${escapeHtml(indicator)}. Some attendance alerts are paused.</p>` : "";
 }
