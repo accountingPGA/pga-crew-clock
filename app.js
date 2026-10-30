@@ -1,3 +1,261 @@
+const APP_REVISION_V30 = "pga-crew-clock-v30-vacation-b-20261029";
+/* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
+(function (root) {
+  "use strict";
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const stable = value => JSON.stringify(sort(value));
+  function sort(value) {
+    if (Array.isArray(value)) return value.map(sort);
+    if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(k => [k, sort(value[k])]));
+    return value;
+  }
+  const keyFor = p => JSON.stringify([p.worker, p.clientShiftId]);
+  class Outbox {
+    constructor(options = {}) {
+      this.indexedDB = options.indexedDB || root.indexedDB;
+      this.name = options.name || "pga-crew-clock-outbox-v30";
+      this.now = options.now || Date.now;
+      this.owner = options.owner || `${Date.now()}-${Math.random()}`;
+      this.db = null;
+      this.opening = null;
+      this.version = options.version || 2;
+      this.store = options.store || "entries";
+      if (!["entries", "starts"].includes(this.store)) throw new Error("Invalid outbox store");
+      this.running = null;
+    }
+    async open() {
+      if (this.db) return;
+      if (this.opening) return this.opening;
+      if (!this.indexedDB) throw new Error("IndexedDB is unavailable. Clock-out has NOT been recorded locally.");
+      this.opening = new Promise((resolve, reject) => {
+        let failed = false;
+        const fail = error => { failed = true; reject(error); };
+        const req = this.indexedDB.open(this.name, this.version);
+        req.onupgradeneeded = () => {
+          if (failed) { req.transaction.abort(); return; }
+          // Additive migrations only. Existing stores and records are never recreated.
+          for (const name of ["entries", "conflicts", "meta", ...(this.version >= 2 ? ["starts"] : [])]) {
+            if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name, { keyPath: "key" });
+            else if (req.transaction.objectStore(name).keyPath !== "key") {
+              fail(new Error("Unrecognized local database schema. Existing records were not changed; office review required."));
+              req.transaction.abort();
+              return;
+            }
+          }
+        };
+        req.onerror = () => fail(req.error);
+        req.onblocked = () => fail(new Error("Local database upgrade blocked. Preserve other Crew Clock tabs before closing them; reopen this app after review."));
+        req.onsuccess = () => {
+          if (failed) { req.result.close(); return; }
+          const required = ["entries", "conflicts", "meta", ...(this.version >= 2 ? ["starts"] : [])];
+          if (required.some(name => !req.result.objectStoreNames.contains(name))) {
+            req.result.close();
+            fail(new Error("Local database stores are missing. Existing data was left untouched."));
+            return;
+          }
+          const check = req.result.transaction(required, "readonly");
+          if (required.some(name => check.objectStore(name).keyPath !== "key")) {
+            req.result.close();
+            fail(new Error("Unrecognized local database keys. Existing data was left untouched."));
+            return;
+          }
+          req.result.onversionchange = () => { req.result.close(); this.db = null; };
+          this.db = req.result;
+          resolve(req.result);
+        };
+      });
+      try { await this.opening; } finally { this.opening = null; }
+    }
+    async transaction(stores, mode, work) {
+      await this.open();
+      return new Promise((resolve, reject) => {
+        let result;
+        const tx = this.db.transaction(stores, mode);
+        tx.oncomplete = () => resolve(result);
+        tx.onabort = tx.onerror = () => reject(tx.error || new Error("Local database transaction failed"));
+        try { work(tx, value => { result = value; }); } catch (error) { tx.abort(); reject(error); }
+      });
+    }
+    async list() {
+      return this.transaction([this.store], "readonly", (tx, done) => {
+        tx.objectStore(this.store).getAll().onsuccess = e => done(e.target.result);
+      });
+    }
+    async meta(key, value) {
+      return this.transaction(["meta"], value === undefined ? "readonly" : "readwrite", (tx, done) => {
+        const store = tx.objectStore("meta");
+        if (value !== undefined) store.put({ key, value: clone(value) });
+        else store.get(key).onsuccess = e => done(e.target.result?.value);
+      });
+    }
+    async enqueue(shift, payload, schedule = null, options = {}) {
+      const isStart = this.store === "starts";
+      if (!payload.clientShiftId || !payload.worker || !payload.startIso || (isStart ? !payload.deviceId || !payload.jobsite : !payload.endIso || !["Yes", "No"].includes(payload.lunch))) throw new Error("Incomplete shift. It has NOT been recorded locally.");
+      const key = keyFor(payload);
+      const immutable = { payload: clone(payload), schedule: schedule ? clone(schedule) : null };
+      const result = await this.transaction([this.store, "conflicts", ...(isStart ? ["entries"] : [])], "readwrite", (tx, done) => {
+        const entries = tx.objectStore(this.store);
+        entries.get(key).onsuccess = e => {
+          const existing = e.target.result;
+          if (existing) {
+            if (stable(existing.immutable) !== stable(immutable)) {
+              tx.objectStore("conflicts").put({ key: `${this.store}:${key}:${this.now()}:${Math.random()}`, store: this.store, entryKey: key, shift: clone(shift), immutable, capturedAt: this.now() });
+              existing.status = "attention";
+              existing.blocked = true;
+              existing.error = "Conflicting records for the same session. Original and alternate records preserved; office review required.";
+              entries.put(existing);
+            }
+            done(existing);
+            return;
+          }
+          const entry = { key, immutable, shift: clone(shift), status: "queued", attempts: 0, nextAttempt: 0, capturedAt: this.now(), verifyOnly: !!options.verifyOnly, error: "", leaseUntil: 0 };
+          if (isStart) {
+            entries.getAll().onsuccess = event => {
+              const starts = event.target.result;
+              tx.objectStore("entries").getAll().onsuccess = completed => {
+                if (starts.some(r => r.shift.worker === shift.worker && !completed.target.result.some(end => end.shift.worker === shift.worker && end.shift.id === r.shift.id))) {
+                  done({blocked:true,error:"Another clock-in is active on this device. Reopen that shift; no additional clock-in was recorded."});
+                  return;
+                }
+                entries.put(entry);done(entry);
+              };
+            };
+          } else { entries.put(entry);done(entry); }
+        };
+      });
+      if (result.blocked) throw new Error(result.error);
+      return result;
+    }
+    async claim(worker, manual = false, excluded = new Set()) {
+      return this.transaction([this.store], "readwrite", (tx, done) => {
+        const entries = tx.objectStore(this.store);
+        entries.getAll().onsuccess = e => {
+          const now = this.now();
+          const row = e.target.result.filter(r => !excluded.has(r.key) && r.immutable.payload.worker === worker && r.status !== "saved" && !r.blocked && (r.leaseUntil || 0) <= now && (manual || r.status !== "attention") && (manual || r.nextAttempt <= now))
+            .sort((a, b) => a.capturedAt - b.capturedAt)[0];
+          if (!row) return done(null);
+          row.lease = `${this.owner}:${now}:${Math.random()}`;
+          row.leaseUntil = now + 60000;
+          row.status = "sending";
+          row.attempts++;
+          entries.put(row);
+          done(row);
+        };
+      });
+    }
+    async finish(entry, patch) {
+      return this.transaction([this.store], "readwrite", (tx, done) => {
+        const store = tx.objectStore(this.store);
+        store.get(entry.key).onsuccess = e => {
+          const current = e.target.result;
+          if (!current || current.lease !== entry.lease || current.blocked) return done(current);
+          Object.assign(current, patch, { lease: null, leaseUntil: 0 });
+          store.put(current);
+          done(current);
+        };
+      });
+    }
+    async owns(entry) {
+      return this.transaction([this.store], "readonly", (tx, done) => {
+        tx.objectStore(this.store).get(entry.key).onsuccess = e => {
+          const current = e.target.result;
+          done(!!current && !current.blocked && current.lease === entry.lease && current.leaseUntil > this.now() && stable(current.immutable) === stable(entry.immutable));
+        };
+      });
+    }
+    async reviewSnapshot(worker, sessionId) {
+      const key = keyFor({ worker, clientShiftId: sessionId });
+      return this.transaction([this.store, "conflicts"], "readonly", (tx, done) => {
+        const result = { schemaVersion: this.version, capturedAt: this.now(), key, original: null, alternatives: [] };
+        tx.objectStore(this.store).get(key).onsuccess = e => { result.original = e.target.result || null; done(result); };
+        tx.objectStore("conflicts").getAll().onsuccess = e => { result.alternatives = e.target.result.filter(r => (!r.store || r.store === this.store) && (r.entryKey === key || r.key.startsWith(key + ":"))); done(result); };
+      });
+    }
+    static verifyShift(data, payload) {
+      const receipt = data?.receipt;
+      const expectedId = `CC-${payload.date.replace(/[^0-9]/g, "")}-${payload.clientShiftId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}`;
+      if (data?.ok !== true || !receipt || receipt.version !== 30 || data.submissionId !== expectedId || receipt.submissionId !== expectedId || receipt.sessionId !== payload.clientShiftId || stable(receipt.payload) !== stable(payload)) {
+        const error = new Error("Server receipt missing or does not match the original shift. Local record retained.");
+        error.needsAttention = true;
+        throw error;
+      }
+      return receipt;
+    }
+    static verifyStart(data, payload) {
+      const receipt = data?.receipt;
+      if (data?.ok !== true || receipt?.version !== 30 || receipt?.type !== "clockIn" || receipt.sessionId !== payload.clientShiftId || stable(receipt.payload) !== stable(payload)) {
+        throw Object.assign(new Error("Clock-in receipt missing or mismatched. Original clock-in retained for office review."), { needsAttention: true });
+      }
+      return receipt;
+    }
+    static scheduleProof(report) {
+      return Object.fromEntries(["scheduleId", "date", "jobsite", "scheduledStart", "scheduledEnd", "reportedBy", "sourceSubmissionId"].map(k => [k, report[k] || ""]));
+    }
+    static verifySchedule(data, report) {
+      if (data?.ok !== true || data.receipt?.version !== 30 || data.scheduleId !== report.scheduleId || stable(data.receipt.report) !== stable(Outbox.scheduleProof(report))) {
+        const error = new Error("Crew schedule receipt does not match. Confirmation preserved for retry.");
+        error.needsAttention = true;
+        throw error;
+      }
+    }
+    async drain(worker, send, options = {}) {
+      if (this.running) {
+        const running = this.running;
+        if (!options.manual) return running;
+        await running;
+        return this.drain(worker, send, options);
+      }
+      this.running = this.run(worker, send, options).finally(() => { this.running = null; });
+      return this.running;
+    }
+    async run(worker, send, options) {
+      // Each record is attempted at most once per drain, even under manual retry.
+      const visited = new Set(options.exclude || []);
+      let attempted = 0;
+      for (;;) {
+        if (options.maxEntries && attempted >= options.maxEntries) break;
+        if (options.canSend && !options.canSend(worker)) break;
+        const entry = await this.claim(worker, !!options.manual, visited);
+        if (!entry) break;
+        visited.add(entry.key);
+        attempted++;
+        let receipt = entry.receipt;
+        try {
+          if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
+          if (this.store === "starts") {
+            const data = await send("saveClockIn", { clockIn: clone(entry.immutable.payload), clientProtocol: 30 });
+            receipt = Outbox.verifyStart(data, entry.immutable.payload);
+            await this.finish(entry, { status: "saved", receipt, savedAt: this.now(), error: "" });
+            if (options.onChange) await options.onChange();
+            continue;
+          }
+          // Re-send the same immutable shift to reconcile a lost acknowledgement or cleanup failure.
+          const data = await send("saveShift", { shift: clone(entry.immutable.payload), clientProtocol: 30, verifyOnly: entry.verifyOnly });
+          receipt = Outbox.verifyShift(data, entry.immutable.payload);
+          if (entry.immutable.schedule) {
+            // A late response must not initiate another request after conflict, lease takeover or logout.
+            if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
+            const report = { ...clone(entry.immutable.schedule), sourceSubmissionId: data.submissionId };
+            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly });
+            Outbox.verifySchedule(scheduleData, report);
+          }
+          if (data.openShiftCleanup?.ok === false) throw new Error("Hours received; open-shift cleanup pending. Retrying safely.");
+          await this.finish(entry, { status: "saved", receipt, savedAt: this.now(), error: "" });
+        } catch (error) {
+          const attention = !!(error.needsAttention || error.isBackendError && !error.retryable);
+          const delay = Math.min(300000, 2000 * 2 ** Math.min(entry.attempts, 7)) + Math.floor(Math.random() * 1000);
+          await this.finish(entry, { status: attention ? "attention" : "queued", receipt, error: error.message || String(error), nextAttempt: this.now() + delay });
+          if (options.onError) options.onError(error, entry);
+        }
+        if (options.onChange) await options.onChange();
+      }
+    }
+  }
+  Outbox.stable = stable;
+  root.CrewClockOutbox = Outbox;
+  if (typeof module !== "undefined") module.exports = Outbox;
+})(typeof window !== "undefined" ? window : globalThis);
+
 const CONFIG = {
   apiUrl: normalizeConfigText(window.CREW_CLOCK_CONFIG?.apiUrl || ""),
   vapidPublicKey: normalizeConfigText(window.CREW_CLOCK_CONFIG?.vapidPublicKey || ""),
@@ -92,12 +350,15 @@ const els = {
   toast: document.querySelector("#toast"),
 };
 
+let operationsReadV30 = { worker: "", token: "", loadedAt: null, day: "", loading: false, error: "" };
+
 let payroll = {
   employees: [],
   jobsites: [],
   absences: [],
   clockStates: [],
   submissions: [],
+  vacations: {status: "unavailable", date: "", items: [], lastSuccessfulAt: null},
   myHours: [],
   myHoursSummary: null,
   myHoursMessage: "",
@@ -116,6 +377,16 @@ let payroll = {
   loadedAt: null,
 };
 
+const V30_UI_KEY = "pga-crew-clock-ui-v30";
+const outbox = new CrewClockOutbox();
+const clockIns = new CrewClockOutbox({store: "starts"});
+let clockInSnapshot = [];
+let offlineClockInGrant = null;
+let clockSyncRunning = null;
+let offlineReady = false;
+let offlineError = "";
+let localCaptureBusy = false;
+let syncTimer;
 let state = loadState();
 let pinBuffer = "";
 let pendingClockOutShiftId = null;
@@ -129,9 +400,14 @@ let toastTimer;
 let renderTimer;
 let operationsRefreshTimer;
 let bootstrapLoading = false;
+let bootstrapRequestToken = null;
+let bootstrapRequestOwner = null;
+let switchShiftProof = null;
+let loginRequestOwner = null;
 let myHoursRequestPromise = null;
 let lastMyHoursRefreshStartedAt = 0;
 let serviceWorkerRegistration = null;
+let recoveryV30 = { token: null, verifiedAt: 0, error: "", renewalWorker: "", renewing: false, resume: null };
 
 function defaultState() {
   return {
@@ -153,33 +429,37 @@ function defaultState() {
 }
 
 function loadState() {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (!saved) return defaultState();
   try {
+    const saved = localStorage.getItem(V30_UI_KEY) || localStorage.getItem(STORAGE_KEY);
+    if (!saved) return defaultState();
     const parsed = JSON.parse(saved);
-    if (parsed.day === todayKey()) {
-      const hydrated = { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, shifts: parsed.shifts || [], scheduleReports: parsed.scheduleReports || [], expandedAlertSections: parsed.expandedAlertSections || {}, expandedTransfers: parsed.expandedTransfers || {} };
-      if (!hydrated.auth?.worker || !hydrated.activeShifts?.[hydrated.auth.worker]) {
-        hydrated.selectedJobsite = "";
-      }
-      return hydrated;
-    }
-  } catch {
-    localStorage.removeItem(STORAGE_KEY);
+    return { ...defaultState(), ...parsed, activeShifts: parsed.activeShifts || {}, shifts: parsed.shifts || [], scheduleReports: parsed.scheduleReports || [] };
+  } catch (error) {
+    offlineError = "Local state could not be read. Existing storage was left untouched; contact the office.";
+    return defaultState();
   }
-  return defaultState();
 }
 
 function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  // V29 storage is a read-only migration source. Never overwrite or remove it.
+  try {
+    localStorage.setItem(V30_UI_KEY, JSON.stringify(state));
+    return true;
+  } catch (error) {
+    offlineError = "Device storage failed. Pending IndexedDB records are retained. Contact the office.";
+    setConnection("error", offlineError);
+    return false;
+  }
 }
 
 function getOrCreateDeviceId() {
-  const existing = localStorage.getItem(DEVICE_KEY);
-  if (existing) return existing;
-  const deviceId = newId();
-  localStorage.setItem(DEVICE_KEY, deviceId);
-  return deviceId;
+  try {
+    const existing = localStorage.getItem(DEVICE_KEY);
+    if (existing) return existing;
+    const deviceId = newId();
+    localStorage.setItem(DEVICE_KEY, deviceId);
+    return deviceId;
+  } catch { return newId(); }
 }
 
 function apiReady() {
@@ -195,39 +475,55 @@ async function apiGet(action) {
   return parseApiResponse(response);
 }
 
-async function apiPost(action, payload = {}) {
+async function apiPost(action, payload = {}, readOptions = {}) {
   if (!apiReady()) throw new Error("Add the Apps Script Web App URL in index.html.");
   const body = new URLSearchParams();
   body.set("payload", JSON.stringify({ action, ...payload }));
-  const response = await apiFetch(CONFIG.apiUrl, {
-    method: "POST",
-    body,
-  });
-  return parseApiResponse(response);
+  // Only the read-only My Hours route gets the longer, body-inclusive deadline.
+  const boundedRead = ["login", "bootstrap", "myHours"].includes(action) && readOptions.boundedRead === true;
+  try {
+    const response = await apiFetch(CONFIG.apiUrl, { method: "POST", body }, boundedRead ? 60000 : 20000, boundedRead);
+    return boundedRead ? response : await parseApiResponse(response);
+  } catch (error) {
+    // Late responses from an older sign-in must not invalidate the current employee.
+    if (payload.token && payload.token === state.auth?.token) recoveryFailureV30(error);
+    throw error;
+  }
 }
 
-async function apiFetch(url, options) {
+async function apiFetch(url, options, timeoutMs = 20000, parseWithinTimeout = false) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => {
+      controller.abort();
+      reject(new Error("Request timed out"));
+    }, timeoutMs);
+  });
   try {
-    return await fetch(url, options);
+    const request = (async () => {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      return parseWithinTimeout ? await parseApiResponse(response) : response;
+    })();
+    return await Promise.race([request, timeout]);
   } catch (error) {
-    const networkError = new Error("Network/offline connection failure. Your save is still kept on this device for retry.");
+    if (error.isBackendError) throw error;
+    const networkError = new Error("Connection interrupted or timed out. Pending clock-outs remain on this device.");
     networkError.isNetworkError = true;
-    networkError.originalMessage = error?.message || "";
     throw networkError;
-  }
+  } finally { window.clearTimeout(timer); }
 }
 
 async function parseApiResponse(response) {
   let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error("Payroll 2.0 returned an unreadable response.");
-  }
-  if (data.ok === false) {
-    const error = new Error(data.error || "Payroll 2.0 request failed.");
+  try { data = await response.json(); }
+  catch { throw new Error("Payroll 2.0 returned an unreadable response. Local records retained."); }
+  if (!response.ok || data?.ok !== true) {
+    const error = new Error(data?.error || `Payroll 2.0 request failed (${response.status}).`);
     error.isBackendError = true;
-    error.status = response.status;
+    error.code = data?.code || "";
+    error.httpStatus = response.status;
+    error.retryable = data?.retryable === true || response.status === 429 || response.status >= 500;
     throw error;
   }
   return data;
@@ -238,14 +534,18 @@ function arrayOrEmpty(value) {
 }
 
 function setup() {
+  ensureSyncPanelV30();
   els.keypad.addEventListener("click", (event) => {
     const key = event.target.closest("button")?.dataset.key;
     if (key) handlePinKey(key);
   });
   window.addEventListener("keydown", handleKeyboardPin);
-  window.addEventListener("focus", refreshMyHoursFromAppResume);
+  window.addEventListener("focus", resumeOfflineSync);
+  window.addEventListener("online", resumeOfflineSync);
+  window.addEventListener("pageshow", resumeOfflineSync);
+  window.addEventListener("offline", () => setConnection("error", "Offline — local records retained."));
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshMyHoursFromAppResume();
+    if (!document.hidden) resumeOfflineSync();
   });
   els.logoutButton.addEventListener("click", logout);
   els.refreshButton.addEventListener("click", loadBootstrap);
@@ -283,13 +583,10 @@ function setup() {
   registerServiceWorker();
   renderTimer = window.setInterval(render, 1000);
   operationsRefreshTimer = window.setInterval(refreshOperationsIfOpen, OPERATIONS_REFRESH_MS);
-  if (state.auth) {
-    showApp();
-    loadBootstrap();
-  } else {
-    showLogin("");
-  }
+  if (state.auth) showApp(); else showLogin("");
   render();
+  initializeOffline().catch(storageFailureV30);
+  syncTimer = window.setInterval(() => syncOutbox(), 15000);
 }
 
 function handleKeyboardPin(event) {
@@ -324,49 +621,50 @@ function renderPinDots() {
 }
 
 async function loginWithPin() {
+  const owner={};loginRequestOwner=owner;
+  const pin=pinBuffer;
   setLoginMessage("Checking PIN...");
   try {
-    const data = await apiPost("login", { pin: pinBuffer });
+    const data=await readOnlyRequestV30("login",{pin},()=>loginRequestOwner===owner);
+    if(loginRequestOwner!==owner)return;
     resetMyHoursState();
-    state.auth = {
-      token: data.token,
-      worker: data.employee.worker,
-      role: data.employee.role || "Employee",
-      attendanceRequired: data.employee.attendanceRequired || "No",
-      workerType: normalizeWorkerType(data.employee.workerType),
-      expiresAt: data.expiresAt,
-      signedInAt: new Date().toISOString(),
-    };
-    state.lastSync = "Signed in";
-    state.activeTab = "clock";
-    pinBuffer = "";
-    saveState();
-    renderPinDots();
-    showApp();
+    state.auth={token:data.token,worker:data.employee.worker,role:data.employee.role||"Employee",attendanceRequired:data.employee.attendanceRequired||"No",workerType:normalizeWorkerType(data.employee.workerType),expiresAt:data.expiresAt,signedInAt:new Date().toISOString()};
+    recoveryV30.token=null;recoveryV30.verifiedAt=0;recoveryV30.error="";recoveryV30.renewalWorker="";
+    state.lastSync="Signed in";state.activeTab="clock";pinBuffer="";
+    saveState();renderPinDots();showApp();
     await loadBootstrap();
-    showToast(`Signed in as ${state.auth.worker}`);
-  } catch (error) {
-    const message = error.message === "DUPLICATE_PIN"
-      ? "Duplicate PIN detected. Please contact the office."
-      : error.message || "PIN not accepted";
-    pinBuffer = "";
-    renderPinDots();
-    setLoginMessage(message, true);
-  }
+    if(loginRequestOwner!==owner)return;
+    await syncOutbox();
+    if(loginRequestOwner===owner&&state.auth?.worker===data.employee.worker)showToast(`Signed in as ${state.auth.worker}`);
+  } catch(error) {
+    if(loginRequestOwner!==owner)return;
+    pinBuffer="";renderPinDots();
+    setLoginMessage(error.message==="DUPLICATE_PIN"?"Duplicate PIN detected. Please contact the office.":error.message||"PIN not accepted",true);
+  } finally {if(loginRequestOwner===owner)loginRequestOwner=null;}
 }
 
 async function loadBootstrap(options = {}) {
-  if (bootstrapLoading) return;
+  if(!state.auth||!apiReady())return;
+  if (authExpiredV30()) { recoveryFailureV30(new Error("Session expired. Sign in again.")); setConnection("error", "Renew sign-in. Local records retained."); return; }
+  const requestToken=state.auth.token,requestWorker=currentWorker(),owner={quiet:options.quiet===true};
+  const sameEmployee=()=>state.auth?.token===requestToken&&currentWorker()===requestWorker;
+  if(bootstrapLoading&&bootstrapRequestToken===requestToken)return;
+  bootstrapRequestToken=requestToken;bootstrapRequestOwner=owner;
   bootstrapLoading = true;
+  markOperationsReadV30("loading",requestWorker,requestToken);
+  if(state.activeTab === "operations")render();
   if (!options.quiet) setConnection("loading", "Refreshing Payroll 2.0");
   try {
-    const data = await apiPost("bootstrap", { token: state.auth?.token });
+    const data = await readOnlyRequestV30("bootstrap", { token: requestToken, reconcileActiveSessionId: state.activeShifts?.[requestWorker]?.id || "" }, sameEmployee);
+    if(!sameEmployee())return;
+    markOperationsReadV30("success",requestWorker,requestToken,data);
     payroll = {
       employees: arrayOrEmpty(data.employees),
       jobsites: arrayOrEmpty(data.jobsites),
       absences: arrayOrEmpty(data.absences),
       clockStates: arrayOrEmpty(data.clockStates),
       submissions: arrayOrEmpty(data.submissions),
+      vacations: mergeCrewVacations(data.capabilities?.canUseOperations ? data.vacations : null, data.capabilities?.canUseOperations ? payroll.vacations : null),
       myHours: payroll.myHours,
       myHoursSummary: payroll.myHoursSummary,
       myHoursMessage: payroll.myHoursMessage,
@@ -387,16 +685,34 @@ async function loadBootstrap(options = {}) {
     if (state.absenceDate === todayKey() && !payroll.absences.some((entry) => entry.worker === currentWorker() && entry.date === todayKey() && entry.status === "Absent")) {
       state.absenceDate = "";
     }
+    const cachedWorker = requestWorker;
+    const tokenParts = String(requestToken).split(".");
+    let expiresAt = 0;
+    try { expiresAt = Number(JSON.parse(atob(tokenParts[0].replace(/-/g,"+").replace(/_/g,"/"))).exp); } catch {}
+    const tokenDigest=await tokenDigestV30(requestToken);
+    if(!sameEmployee())return;
+    offlineClockInGrant = {worker:cachedWorker,tokenDigest,expiresAt,checkedAt:Date.now()};
+    await outbox.meta("bootstrap:" + cachedWorker, { jobsites: arrayOrEmpty(data.jobsites), capabilities: data.capabilities||{}, employees: arrayOrEmpty(data.employees).filter(e => e.worker === cachedWorker), offlineClockInGrant });
+    if(!sameEmployee())return;
+    await reconcileRestoredActiveV30(data.completedActiveSession,requestWorker,requestToken);
+    if(!sameEmployee())return;
     restoreCurrentOpenShift();
     state.lastSync = "Ready";
     saveState();
-    if (!options.quiet) setConnection("ready", "Connected to Payroll 2.0");
+    recoveryV30.token = requestToken; recoveryV30.verifiedAt = Date.now(); recoveryV30.error = "";
+    recoveryV30.renewalWorker = "";
+    switchShiftProof = {token:requestToken,worker:requestWorker,open:arrayOrEmpty(data.clockStates).find(open => open.worker === requestWorker && open.status === "Clocked In")};
+    renderRecoveryV30();
+    setConnection("ready", "Connected to Payroll 2.0");
   } catch (error) {
+    if(!sameEmployee())return;
+    markOperationsReadV30("error",requestWorker,requestToken,null,error.message);
     state.lastSync = "Connection failed";
-    if (!options.quiet) setConnection("error", error.message);
+    recoveryFailureV30(error);
+    setConnection("error", error.message);
   } finally {
-    bootstrapLoading = false;
-    render();
+    if(bootstrapRequestOwner===owner){bootstrapLoading=false;bootstrapRequestToken=null;bootstrapRequestOwner=null;}
+    if(sameEmployee())render();
   }
 }
 
@@ -404,33 +720,50 @@ async function loadMyHours(options = {}) {
   if (!state.auth || !apiReady()) return;
   if (myHoursRequestPromise) return myHoursRequestPromise;
   const requestToken = state.auth.token;
+  const requestWorker = currentWorker();
+  const sameEmployee = () => state.auth?.token === requestToken && currentWorker() === requestWorker;
   lastMyHoursRefreshStartedAt = Date.now();
-  myHoursRequestPromise = (async () => {
+  const request = (async () => {
     payroll.myHoursLoading = true;
     if (options.renderBefore !== false && state.activeTab === "myHours") render();
     try {
-      const data = await apiPost("myHours", { token: requestToken });
-      if (!state.auth || state.auth.token !== requestToken) return;
+      let data;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (!sameEmployee()) return;
+        try {
+          data = await apiPost("myHours", { token: requestToken }, { boundedRead: true });
+          break;
+        } catch (error) {
+          if (!sameEmployee()) return;
+          if (attempt || navigator.onLine === false || !(error.isNetworkError || error.retryable)) throw error;
+          payroll.myHoursMessage = "Connection interrupted. Retrying My Hours…";
+          if (state.activeTab === "myHours") render();
+          await new Promise(resolve => window.setTimeout(resolve, 750));
+        }
+      }
+      if (!sameEmployee()) return;
       payroll.myHours = arrayOrEmpty(data.rows);
       payroll.myHoursSummary = data.payrollSummary || null;
       payroll.myHoursMessage = data.message || "";
       payroll.payrollPeriod = data.payrollPeriod || payroll.payrollPeriod || {};
-      if (state.auth && data.workerType) state.auth.workerType = normalizeWorkerType(data.workerType);
+      if (data.workerType) state.auth.workerType = normalizeWorkerType(data.workerType);
       payroll.myHoursLoadedAt = new Date().toISOString();
     } catch (error) {
-      payroll.myHours = [];
-      payroll.myHoursSummary = null;
-      payroll.myHoursMessage = error.message || "Could not load My Hours.";
+      if (!sameEmployee()) return;
+      // Keep the last successful result on this employee's screen, clearly marked stale.
+      payroll.myHoursMessage = payroll.myHoursLoadedAt
+        ? "Could not refresh My Hours. Showing the last successful result. Use Refresh to try again."
+        : "Could not load My Hours. Use Refresh to try again. Pending clock-outs remain on this device.";
     } finally {
-      payroll.myHoursLoading = false;
-      if (options.renderAfter !== false && state.activeTab === "myHours") render();
+      if (sameEmployee()) {
+        payroll.myHoursLoading = false;
+        if (options.renderAfter !== false && state.activeTab === "myHours") render();
+      }
     }
   })();
-  try {
-    return await myHoursRequestPromise;
-  } finally {
-    myHoursRequestPromise = null;
-  }
+  myHoursRequestPromise = request;
+  try { return await request; }
+  finally { if (myHoursRequestPromise === request) myHoursRequestPromise = null; }
 }
 
 function requestMyHoursRefresh(options = {}) {
@@ -449,6 +782,9 @@ function refreshMyHoursFromAppResume() {
 }
 
 function resetMyHoursState() {
+  // A previous employee's in-flight read cannot block or update the next employee.
+  myHoursRequestPromise = null;
+  offlineClockInGrant = null;
   payroll.myHours = [];
   payroll.myHoursSummary = null;
   payroll.myHoursMessage = "";
@@ -476,7 +812,9 @@ function showApp() {
 
 function logout() {
   resetMyHoursState();
+  loginRequestOwner = null;
   state.auth = null;
+  recoveryV30.token=null;recoveryV30.verifiedAt=0;recoveryV30.error="";recoveryV30.renewalWorker="";
   state.activeTab = "clock";
   saveState();
   showLogin("");
@@ -636,7 +974,7 @@ function currentActiveShift() {
 }
 
 function completedRowsFor(worker = currentWorker()) {
-  return state.shifts.filter((shift) => shift.worker === worker && localDateKey(new Date(shift.start)) === todayKey());
+  return state.shifts.filter((shift) => shift.worker === worker && (localDateKey(new Date(shift.start)) === todayKey() || shift.syncStatus !== "saved"));
 }
 
 function activeShiftFor(worker) {
@@ -651,7 +989,10 @@ function restoreCurrentOpenShift() {
     return;
   }
 
+  if (state.shifts.some(s => s.worker === worker && s.id === open.sessionId && (s.clearOpenShift || s.nextOpenShift))) return;
   const existing = state.activeShifts[worker];
+  if (existing?.id === open.sessionId && existing.start === open.clockInAt && existing.jobsite === open.jobsite) return; // preserve durable start metadata
+  if (existing && existing.id !== open.sessionId && Date.parse(existing.start) >= Date.parse(open.clockInAt)) return;
   state.activeShifts[worker] = {
     id: open.sessionId || existing?.id || newId(),
     worker,
@@ -701,37 +1042,29 @@ function setLocalAbsence(isAbsent) {
 }
 
 async function toggleClock() {
-  if (!state.auth) return;
-  if (!payroll.jobsites.length) return showToast("No active jobsites in Payroll 2.0");
-  if (isAbsentToday()) return showToast("You have been marked absent for today. Please contact your foreman or the office if this is incorrect.");
+  if (!state.auth || !offlineReady || localCaptureBusy) return;
   const current = currentActiveShift();
-  if (current) {
-    openLunchDialog("clockOut", current.id);
-    return;
-  }
-
-  const selectedJobsite = findJobsite(state.selectedJobsite);
-  if (!selectedJobsite) return showToast("Select a jobsite before clocking in.");
-
-  const nextShift = {
-    id: newId(),
-    worker: currentWorker(),
-    jobsite: selectedJobsite.jobsite,
-    start: new Date().toISOString(),
-  };
-  setConnection("loading", "Opening shift");
+  if (current) { openLunchDialog("clockOut",current.id); return; }
+  const selected = findJobsite(state.selectedJobsite);
+  if (!selected) return showToast("Select a jobsite before clocking in.");
+  if (isAbsentToday()) return showToast("You have been marked absent. Contact the office.");
+  const worker = currentWorker(), token = state.auth.token;
+  const capturedStart = new Date().toISOString();
+  localCaptureBusy = true; render();
   try {
-    await recordClockState("Clocked In", nextShift);
-    state.activeShifts[currentWorker()] = nextShift;
+    if (navigator.onLine === false && (!offlineClockInAllowedV30() || await tokenDigestV30(token) !== offlineClockInGrant.tokenDigest)) throw new Error("Offline clock-in needs a recent successful sign-in and jobsite download for this employee. Reconnect first.");
+    if (currentWorker() !== worker || state.auth?.token !== token) throw new Error("Sign-in changed. Clock-in was not recorded.");
+    const shift = {id:newId(),worker,jobsite:selected.jobsite,start:capturedStart,deviceId:state.deviceId,requiresClockInReceipt:true};
+    await clockIns.enqueue(shift,clockInPayloadV30(shift));
+    state.activeShifts[worker] = shift;
+    await hydrateOutboxV30();
     saveState();
-    setConnection("ready", "Clocked in");
-    await loadMyHours({ quiet: true, renderBefore: false, renderAfter: false });
+    state.lastSync = "Pending Sync — clock-in recorded on this device";
+    showToast(state.lastSync);
     render();
-    showToast("Clocked in");
-  } catch (error) {
-    setConnection("error", error.message || "Clock In failed");
-    showToast("Clock In failed");
-  }
+    void syncOutbox();
+  } catch(error) { setConnection("error",error.message); showToast(error.message); }
+  finally { localCaptureBusy=false;render(); }
 }
 
 function openLunchDialog(mode, shiftId) {
@@ -767,31 +1100,30 @@ async function finishClockOut(lunch) {
 }
 
 async function completeClockOut(current, lunch, crewSchedule) {
-  closeLunchDialog();
-  closeCrewScheduleDialog();
-  const completed = {
-    ...current,
-    end: new Date().toISOString(),
-    lunch,
-    clearOpenShift: true,
-    syncStatus: "pending",
-  };
-  if (crewSchedule) {
-    completed.crewScheduleId = crewSchedule.id;
-    queueCrewScheduleReport({
-      ...crewSchedule,
-      linkedShiftId: completed.id,
-      shiftStartIso: completed.start,
-      shiftEndIso: completed.end,
-      syncStatus: "waiting",
-      error: "",
-    });
-  }
-  state.shifts.unshift(completed);
-  state.lastSync = "Saving";
-  saveState();
+  if (localCaptureBusy || !offlineReady) return;
+  localCaptureBusy = true;
   render();
-  await saveCompletedShift(completed);
+  try {
+    const completed = { ...current, end: new Date().toISOString(), lunch, clearOpenShift: true,
+      deviceId: state.deviceId, syncStatus: "pending" };
+    if (crewSchedule) {
+      completed.crewScheduleId = crewSchedule.id;
+      completed.crewSchedule = { ...crewSchedule, linkedShiftId: completed.id, shiftStartIso: completed.start,
+        shiftEndIso: completed.end, syncStatus: "waiting", error: "" };
+    }
+    // No local completion UI or network call until this IndexedDB transaction commits.
+    await outbox.enqueue(completed, toSubmissionPayload(completed), completed.crewSchedule ? toCrewSchedulePayload(completed.crewSchedule, completed, "") : null);
+    closeLunchDialog();
+    closeCrewScheduleDialog();
+    applyCompletedShiftSideEffects(completed);
+    await hydrateOutboxV30();
+    state.lastSync = "Pending Sync — clock-out recorded on this device";
+    saveState();
+    showToast(state.lastSync);
+    if (navigator.onLine === false) setConnection("error", "Offline — clock-out recorded locally. Pending Sync.");
+    void syncOutbox();
+  } catch (error) { storageFailureV30(error); }
+  finally { localCaptureBusy = false; els.crewScheduleSubmitButton.disabled = false; render(); }
 }
 
 function closeLunchDialog() {
@@ -869,7 +1201,7 @@ function normalizeTimeInput(value) {
 
 function openSwitchDialog() {
   const current = currentActiveShift();
-  if (!current) return;
+  if (!current || !switchJobsiteReady()) return;
   openLunchDialog("switch", current.id);
 }
 
@@ -1070,33 +1402,23 @@ async function removeEmployeeAbsence() {
 async function switchJobsite() {
   const current = currentActiveShift();
   const nextJobsite = els.switchSiteSelect.value;
-  if (!current) return closeSwitchDialog();
-  if (current.id !== pendingSwitchShiftId) return closeSwitchDialog();
+  if (!current || current.id !== pendingSwitchShiftId || !switchJobsiteReady()) return;
   if (!nextJobsite || nextJobsite === current.jobsite) return showToast("Select a different jobsite");
-
   const now = new Date().toISOString();
-  const completed = {
-    ...current,
-    end: now,
-    lunch: pendingSwitchLunch === "Yes" ? "Yes" : "No",
-    travelTo: nextJobsite,
-    syncStatus: "pending",
-  };
-
-  completed.nextOpenShift = {
-    id: newId(),
-    worker: currentWorker(),
-    jobsite: nextJobsite,
-    start: now,
-    travelFrom: current.jobsite,
-  };
-  state.shifts.unshift(completed);
-  state.lastSync = "Saving";
-  closeSwitchDialog();
-  saveState();
-  render();
-  const result = await saveCompletedShift(completed);
-  if (result?.ok) showToast("New jobsite started");
+  const completed = { ...current, end: now, lunch: pendingSwitchLunch === "Yes" ? "Yes" : "No",
+    travelTo: nextJobsite, deviceId: state.deviceId, syncStatus: "pending" };
+  completed.nextOpenShift = { id: newId(), worker: currentWorker(), jobsite: nextJobsite, start: now, travelFrom: current.jobsite };
+  localCaptureBusy = true;
+  try {
+    await outbox.enqueue(completed, toSubmissionPayload(completed));
+    applyCompletedShiftSideEffects(completed);
+    closeSwitchDialog();
+    await hydrateOutboxV30();
+    saveState();
+    showToast("Transfer recorded locally — Pending Sync");
+    void syncOutbox();
+  } catch (error) { storageFailureV30(error); }
+  finally { localCaptureBusy = false; render(); }
 }
 
 async function recordClockState(status, shift = {}) {
@@ -1118,42 +1440,12 @@ async function recordClockState(status, shift = {}) {
 }
 
 async function saveCompletedShift(shift) {
-  updateShiftSync(shift.id, { syncStatus: "pending", error: "" });
-  setConnection("loading", "Saving to Payroll 2.0");
   try {
-    const data = await apiPost("saveShift", {
-      token: state.auth?.token,
-      shift: toSubmissionPayload(shift),
-    });
-    updateShiftSync(shift.id, {
-      syncStatus: "saved",
-      submissionId: data.submissionId,
-      error: "",
-    });
-    applyCompletedShiftSideEffects(shift);
-    state.lastSync = "Saved to Payroll 2.0";
-    await loadMyHours({ quiet: true, renderBefore: false, renderAfter: false });
-    saveState();
-    setConnection("ready", "Saved to Payroll 2.0");
-    if (shift.crewScheduleId) {
-      await saveCrewScheduleReportForShift(shift, data.submissionId);
-    }
-    return { ok: true, data };
-  } catch (error) {
-    if (isSessionExpiredError(error)) {
-      handleExpiredSessionSave(shift);
-      return { ok: false, error };
-    }
-    const message = saveErrorMessage(error, "Save failed, try again");
-    updateShiftSync(shift.id, { syncStatus: "failed", error: message });
-    await notifySaveProblem(shift, error);
-    state.lastSync = message;
-    saveState();
-    setConnection("error", message);
-    return { ok: false, error };
-  } finally {
-    render();
-  }
+    const schedule = shift.crewSchedule || crewScheduleReportForShift(shift.id);
+    await outbox.enqueue(shift, toSubmissionPayload(shift), schedule ? toCrewSchedulePayload(schedule, shift, "") : null);
+    await syncOutbox(true);
+    return { ok: state.shifts.some(s => s.id === shift.id && s.syncStatus === "saved") };
+  } catch (error) { storageFailureV30(error); return { ok: false, error }; }
 }
 
 function saveErrorMessage(error, fallback) {
@@ -1227,37 +1519,9 @@ function updateCrewScheduleSync(id, patch) {
 }
 
 async function saveCrewScheduleReportForShift(shift, submissionId) {
+  await syncOutbox(true);
   const report = crewScheduleReportForShift(shift.id);
-  if (!report || report.syncStatus === "saved") return { ok: true };
-  updateCrewScheduleSync(report.id, { syncStatus: "pending", error: "" });
-  try {
-    const data = await apiPost("saveCrewScheduleReport", {
-      token: state.auth?.token,
-      report: toCrewSchedulePayload(report, shift, submissionId || shift.submissionId || ""),
-    });
-    updateCrewScheduleSync(report.id, {
-      syncStatus: "saved",
-      savedAt: new Date().toISOString(),
-      row: data.row || "",
-      error: "",
-    });
-    state.lastSync = "Clock out and crew schedule saved";
-    saveState();
-    setConnection("ready", "Crew schedule saved");
-    return { ok: true, data };
-  } catch (error) {
-    updateCrewScheduleSync(report.id, {
-      syncStatus: "failed",
-      error: error.message || "Crew schedule not synced.",
-    });
-    state.lastSync = "Clock out saved. Crew schedule not synced.";
-    saveState();
-    setConnection("error", "Clock out saved. Crew schedule not synced.");
-    showToast("Clock out saved. Crew schedule not synced. Retry Saves.");
-    return { ok: false, error };
-  } finally {
-    render();
-  }
+  return { ok: !report || report.syncStatus === "saved" };
 }
 
 function toCrewSchedulePayload(report, shift, submissionId) {
@@ -1292,6 +1556,7 @@ function handleExpiredSessionSave(shift) {
     sessionExpiredNotified: true,
   });
   state.lastSync = "Save failed, try again";
+  loginRequestOwner = null;
   state.auth = null;
   saveState();
   setConnection("error", SESSION_EXPIRED_SAVE_MESSAGE);
@@ -1305,24 +1570,22 @@ function updateShiftSync(id, patch) {
 }
 
 async function retryFailedSaves() {
-  const failed = state.shifts.filter((shift) => shift.syncStatus === "failed");
-  const failedSchedules = state.scheduleReports.filter((report) => report.syncStatus === "failed" || report.syncStatus === "waiting");
-  if (!failed.length && !failedSchedules.length) return showToast("No failed saves");
-  for (const shift of failed) {
-    await saveCompletedShift(shift);
-  }
-  for (const report of failedSchedules) {
-    const shift = state.shifts.find((item) => item.id === report.linkedShiftId && item.syncStatus === "saved");
-    if (shift) await saveCrewScheduleReportForShift(shift, shift.submissionId || "");
-  }
+  await syncOutbox(true);
 }
 
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    serviceWorkerRegistration = await navigator.serviceWorker.register("./service-worker.js");
+    serviceWorkerRegistration = await navigator.serviceWorker.register("./service-worker.js", {updateViaCache:"none"});
+    installUpdateSafetyV30(serviceWorkerRegistration);
+    const notice = document.querySelector('#updateDiscoveryErrorV30');
+    if (notice) notice.hidden = true;
   } catch {
     serviceWorkerRegistration = null;
+    let notice = document.querySelector('#updateDiscoveryErrorV30');
+    if (!notice) { notice=document.createElement('p');notice.id='updateDiscoveryErrorV30';notice.setAttribute('role','status');document.body.append(notice); }
+    notice.hidden=false;
+    notice.textContent='App update check could not start. Your records are retained. Reconnect; checking will retry when you reopen the app.';
   }
 }
 
@@ -1435,6 +1698,7 @@ async function enableNativeWebPushReminders(registration) {
 
 function toSubmissionPayload(shift) {
   return {
+    ...(shift.requiresClockInReceipt ? {requiresClockInReceipt:true} : {}),
     clientShiftId: shift.id,
     worker: shift.worker,
     date: localDateKey(new Date(shift.start)),
@@ -1442,7 +1706,9 @@ function toSubmissionPayload(shift) {
     startIso: shift.start,
     endIso: shift.end,
     lunch: shift.lunch === "Yes" ? "Yes" : "No",
-    notes: "",
+    notes: shift.notes || "",
+    deviceId: shift.deviceId || state.deviceId || "",
+    crewScheduleConfirmation: shift.crewSchedule ? scheduleConfirmationV30(shift.crewSchedule) : null,
     clearOpenShift: !!shift.clearOpenShift,
     nextOpenShift: shift.nextOpenShift ? {
       clientShiftId: shift.nextOpenShift.id,
@@ -1450,17 +1716,20 @@ function toSubmissionPayload(shift) {
       date: localDateKey(new Date(shift.nextOpenShift.start)),
       jobsite: shift.nextOpenShift.jobsite,
       startIso: shift.nextOpenShift.start,
-      deviceId: state.deviceId || "",
+      deviceId: shift.deviceId || state.deviceId || "",
     } : null,
   };
 }
 
 function render() {
+  if (state.auth && authExpiredV30() && !recoveryV30.renewalWorker) recoveryFailureV30(new Error("Session expired. Sign in again."));
+  if (els.connectionBar.classList.contains("ready") && !serverVerifiedV30()) setConnection("error", recoveryV30.error || "Server connection needs rechecking. Local records retained.");
   if (!state.auth) {
     renderPinDots();
     return;
   }
   showApp();
+  renderRecoveryV30();
   renderShell();
   renderClock();
   renderMyHours();
@@ -1525,11 +1794,11 @@ function renderClock() {
   }).format(new Date());
   els.statusPanel.style.setProperty("--site-color", site?.colour || "#007f73");
   els.siteSwatch.style.background = selectedJobsite?.colour || "#8a94a6";
-  els.clockButton.disabled = current
-    ? !connectionReady || !canClock || absent
-    : !connectionReady || !canClock || absent || !selectedJobsite;
-  els.switchButton.disabled = !connectionReady || !canClock;
-  const siteSelectDisabled = !connectionReady || !!current || !canClock || absent;
+  els.clockButton.disabled = !offlineReady || localCaptureBusy || (current
+    ? false
+    : !(connectionReady || offlineClockInAllowedV30()) || !canClock || absent || !selectedJobsite);
+  els.switchButton.disabled = !switchJobsiteReady();
+  const siteSelectDisabled = !(connectionReady || offlineClockInAllowedV30()) || !!current || !canClock || absent;
   if (document.activeElement !== els.siteSelect && els.siteSelect.disabled !== siteSelectDisabled) {
     els.siteSelect.disabled = siteSelectDisabled;
   }
@@ -1547,11 +1816,11 @@ function renderClock() {
   els.statusPill.textContent = connectionStatus.text;
   els.statusPill.className = `status-pill ${connectionStatus.className}`;
 
-  if (!apiReady()) {
+  if (!current && !apiReady()) {
     els.statusDetail.textContent = current ? "" : "Where are you working today?";
-  } else if (!payroll.jobsites.length) {
+  } else if (!current && !payroll.jobsites.length) {
     els.statusDetail.textContent = current ? "" : "Where are you working today?";
-  } else if (absent) {
+  } else if (!current && absent) {
     els.statusDetail.textContent = "You have been marked absent for today.";
     els.clockButton.className = "primary-button";
     els.clockButton.textContent = "CLOCK IN";
@@ -1578,11 +1847,18 @@ function renderClock() {
   els.entryCount.textContent = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
   renderTodayClockStatusCards();
   renderCompletedRows(rows);
+  renderSyncPanelV30();
 }
 
 function renderTodayClockStatusCards() {
-  const summary = dailyTimeSummaryFor(currentWorker(), todayKey());
-  els.todayClockIn.textContent = summary.clockInAt ? timeLabel(summary.clockInAt) : "Not Clocked In";
+  const worker = currentWorker();
+  const current = currentActiveShift();
+  const completed = completedSegmentsFor(worker).filter(segment => segment.end);
+  const latest = completed.reduce((chosen, segment) => !chosen || Date.parse(segment.start) > Date.parse(chosen.start) ? segment : chosen, null);
+  const start = current?.start || latest?.start || "";
+  els.todayClockIn.previousElementSibling.textContent = current ? "Current shift start" : "Last shift start";
+  els.todayClockIn.textContent = start ? timeLabel(start) + (localDateKey(new Date(start)) !== todayKey() ? " (" + localDateKey(new Date(start)) + ")" : "") : "Not Clocked In";
+  const summary = dailyTimeSummaryFor(worker, todayKey());
   const clockOut = clockOutDisplay(summary);
   els.todayClockOut.textContent = clockOut.text;
   els.todayClockOutCard.classList.toggle("pending", clockOut.state === "pending");
@@ -1591,14 +1867,31 @@ function renderTodayClockStatusCards() {
 }
 
 function clockOutDisplay(summary) {
+  if (summary.needsAttention) return { text: "Needs Attention", state: "incomplete" };
+  if (summary.pendingSync) return { text: "Pending Sync", state: "pending" };
   if (summary.pending) return { text: "Pending", state: "pending" };
   if (summary.clockOutAt) return { text: timeLabel(summary.clockOutAt), state: "complete" };
   if (summary.clockInAt) return { text: "Not Clocked Out", state: "incomplete" };
   return { text: "—", state: "empty" };
 }
 
+function switchJobsiteReady() {
+  if (!offlineReady || localCaptureBusy || !state.auth?.token || !serverVerifiedV30() || !apiReady() || !payroll.jobsites.length) return false;
+  if (clockConnectionStatus().state === "ready") return true;
+  // A quiet refresh may reuse recent server proof, never an unverified/offline start.
+  if (!bootstrapLoading || !bootstrapRequestOwner?.quiet || bootstrapRequestToken !== state.auth?.token
+    || !payroll.loadedAt
+    || state.lastSync === "Connection failed" || els.connectionBar.classList.contains("error")) return false;
+  const current = currentActiveShift();
+  const open = switchShiftProof?.open;
+  return !!current && !!open && switchShiftProof.token === state.auth.token && switchShiftProof.worker === currentWorker()
+    && payroll.jobsites.some(site => site.jobsite === current.jobsite)
+    && open.sessionId === current.id && open.jobsite === current.jobsite && open.clockInAt === current.start;
+}
+
 function clockConnectionStatus() {
-  if (!apiReady()) {
+  if (recoveryV30.renewalWorker || authExpiredV30()) return {state:"attention",text:"🔴 Sign in again — records retained",className:"problem"};
+  if (navigator.onLine === false || !apiReady()) {
     return { state: "offline", text: "🔴 Offline", className: "problem" };
   }
   if (bootstrapLoading) {
@@ -1726,6 +2019,14 @@ function myHoursRowsForDisplay() {
     byDate[row.date] = summary;
   });
 
+  state.shifts.filter(s => s.worker === currentWorker() && s.syncStatus !== "saved" && dateWithinPeriod(localDateKey(new Date(s.start)), period)).forEach(s => {
+    const date = localDateKey(new Date(s.start));
+    const summary = byDate[date] || emptyDailyTimeSummary(date);
+    mergeCompletedTime(summary, s.start, s.end);
+    summary.pendingSync = true;
+    summary.needsAttention = summary.needsAttention || s.syncStatus === "failed";
+    byDate[date] = summary;
+  });
   const today = todayKey();
   if (dateWithinPeriod(today, period)) {
     const todaySummary = dailyTimeSummaryFor(currentWorker(), today);
@@ -1734,6 +2035,8 @@ function myHoursRowsForDisplay() {
       summary.clockInAt = earliestTime(summary.clockInAt, todaySummary.clockInAt);
       summary.clockOutAt = latestTime(summary.clockOutAt, todaySummary.clockOutAt);
       summary.pending = summary.pending || todaySummary.pending;
+      summary.pendingSync = summary.pendingSync || todaySummary.pendingSync;
+      summary.needsAttention = summary.needsAttention || todaySummary.needsAttention;
       summary.incomplete = !!summary.clockInAt && !summary.clockOutAt && !summary.pending;
       byDate[today] = summary;
     }
@@ -1774,7 +2077,7 @@ function renderCompletedRows(rows) {
           <div class="entry-main">
             <div>
               <span class="entry-title">${escapeHtml(shift.jobsite)}</span>
-              <span class="entry-sub">${timeLabel(shift.start)} - ${timeLabel(shift.end)}</span>
+              <span class="entry-sub">${escapeHtml(localDateKey(new Date(shift.start)))} · ${timeLabel(shift.start)} - ${timeLabel(shift.end)}</span>
               <span class="entry-sub">Lunch: ${escapeHtml(shift.lunch)}</span>
               ${travel ? `<span class="entry-sub">${escapeHtml(travel)}</span>` : ""}
               ${crewScheduleStatusLabel(shift) ? `<span class="entry-sub">${escapeHtml(crewScheduleStatusLabel(shift))}</span>` : ""}
@@ -1817,6 +2120,12 @@ function renderOperations() {
     els.teamList.innerHTML = "";
     return;
   }
+  const operationsView = renderOperationsFreshnessV30();
+  if (!operationsView.hasComplete) {
+    els.clockedInCount.textContent = "—";els.clockedOutCount.textContent = "—";els.teamHours.textContent = "—";
+    els.teamList.innerHTML = '<p class="empty-state">Complete team data is unavailable. Your saved and pending clock records remain in Clock.</p>';
+    return;
+  }
   const activeEntries = Object.values(state.activeShifts).filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
   const completed = state.shifts.filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
   const todayStates = payroll.clockStates.filter((entry) => entry.date === todayKey());
@@ -1834,9 +2143,11 @@ function renderOperations() {
   els.teamHours.textContent = durationLabel(totalHours);
 
   const groups = buildOperationsGroups(absentWorkers);
+  const vacationNotice = crewVacationNotice();
   els.teamList.innerHTML = groups.length
     ? groups.map(renderOperationsGroup).join("")
     : `<p class="empty-state">No clocked-in, clocked-out, or absent employees today</p>`;
+  els.teamList.innerHTML = vacationNotice + els.teamList.innerHTML;
   bindTransferExpansionState();
 }
 
@@ -1891,6 +2202,7 @@ function operationsHourSegments() {
 
 function buildOperationsGroups(absentWorkers) {
   const groups = new Map();
+  const vacationGroup = {jobsite: "Vacation", colour: "#7353a6", people: []};
   const absentGroup = {
     jobsite: "Absent Today",
     colour: "#b42318",
@@ -1906,21 +2218,29 @@ function buildOperationsGroups(absentWorkers) {
       start: stateRow.clockInAt,
     } : null);
     const activeForHistory = active || null;
+    const pendingSync = state.shifts.find(s => s.worker === employee.worker && localDateKey(new Date(s.start)) === todayKey() && s.syncStatus !== "saved");
     const recent = latestCompletedSegmentFor(employee.worker);
     const clockOutAt = latestCompletedClockOutFor(employee.worker) || stateRow?.clockOutAt || recent?.end || "";
     const transferHistory = transferHistoryFor(employee.worker, activeForHistory);
     const absent = absentWorkers.has(employee.worker);
     const clockedOut = !!recent || stateRow?.status === "Clocked Out";
 
-    if (!active && !absent && !clockedOut) return;
+    const vacation = crewVacationFor(employee.worker);
+    const work = !!active || clockedOut || !!pendingSync;
+    if (vacation && !work) {
+      vacationGroup.people.push({worker: employee.worker, status: "Vacation", statusClass: "vacation", vacation, existingAbsence: absent, canRemoveAbsence: absent && canMarkEmployeeAbsent()});
+      return;
+    }
+    if (!active && !absent && !clockedOut && !pendingSync) return;
 
-    if (absent) {
+    if (absent && !(vacation && work)) {
       absentGroup.people.push({
         worker: employee.worker,
         status: "Absent",
         statusClass: "absent",
         clockIn: "",
         canRemoveAbsence: canMarkEmployeeAbsent(),
+        vacation, vacationConflict: !!vacation && work,
       });
       return;
     }
@@ -1937,9 +2257,10 @@ function buildOperationsGroups(absentWorkers) {
 
     groups.get(jobsite).people.push({
       worker: employee.worker,
-      status: active ? "Clocked In" : clockOutAt ? `Clocked Out ${timeLabel(clockOutAt)}` : "Clocked Out",
-      statusClass: active ? "" : "out",
+      status: pendingSync ? syncLabel(pendingSync) : active ? "Clocked In" : clockOutAt ? `Clocked Out ${timeLabel(clockOutAt)}` : "Clocked Out",
+      statusClass: pendingSync ? syncClass(pendingSync) : active ? "" : "out",
       clockIn: active?.start || recent?.start || stateRow?.clockInAt || "",
+      vacation, vacationConflict: !!vacation && work, existingAbsence: absent,
       switched: transferHistory.length > 0,
       transferHistory,
     });
@@ -1949,6 +2270,7 @@ function buildOperationsGroups(absentWorkers) {
     .filter((group) => group.people.length)
     .sort((a, b) => a.jobsite.localeCompare(b.jobsite));
 
+  if (vacationGroup.people.length) jobsiteGroups.push(vacationGroup);
   if (absentGroup.people.length) jobsiteGroups.push(absentGroup);
   return jobsiteGroups;
 }
@@ -1978,9 +2300,13 @@ function renderOperationsPerson(person) {
         ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
       </div>
       <span class="person-status-stack">
+        ${person.vacation && person.canRemoveAbsence ? `<span class="mini-pill vacation">Vacation</span>` : ""}
         ${person.canRemoveAbsence
           ? `<button class="mini-pill absence-remove-button" type="button" data-worker="${escapeHtml(person.worker)}">Undo Absent</button>`
           : `<span class="mini-pill ${person.statusClass}">${escapeHtml(person.status)}</span>`}
+        ${person.vacation ? `<span class="vacation-dates">${escapeHtml(person.vacation.start)} → ${escapeHtml(person.vacation.end)}</span>` : ""}
+        ${person.vacationConflict ? `<span class="mini-pill vacation-conflict">Vacation/work conflict</span>` : ""}
+        ${person.existingAbsence ? `<span class="mini-pill absent">Existing Absent record</span>` : ""}
         ${person.switched ? `<span class="switch-indicator">↔ Switched</span>` : ""}
       </span>
     </div>
@@ -2133,6 +2459,8 @@ function dailyTimeSummaryFor(worker, dateKey) {
 
   const active = state.activeShifts[worker];
   if (active && localDateKey(new Date(active.start)) === dateKey) mergeOpenTime(summary, active.start);
+  const unsynced = state.shifts.filter(shift => keyForCompare(shift.worker) === workerKey && localDateKey(new Date(shift.start)) === dateKey && shift.syncStatus !== "saved");
+  if (unsynced.length) { summary.pendingSync = true; summary.needsAttention = unsynced.some(s => s.syncStatus === "failed"); unsynced.forEach(shift => mergeCompletedTime(summary, shift.start, shift.end)); }
   summary.incomplete = !!summary.clockInAt && !summary.clockOutAt && !summary.pending;
   return summary;
 }
@@ -2188,9 +2516,9 @@ function renderAlerts() {
     return;
   }
   const groups = buildAlertGroups();
-  const signature = alertGroupsSignature(groups);
+  const signature = alertGroupsSignature(groups) + crewVacationNotice();
   if (els.alertsList.dataset.alertSignature === signature) return;
-  els.alertsList.innerHTML = groups.map(renderAlertGroup).join("");
+  els.alertsList.innerHTML = crewVacationNotice() + groups.map(renderAlertGroup).join("");
   els.alertsList.dataset.alertSignature = signature;
   bindAlertSectionState();
 }
@@ -2237,7 +2565,7 @@ function buildAlertSections() {
       title: "Not Clocked In",
       actionable: true,
       people: activeAttendanceEmployees()
-        .filter((employee) => !hasAttendanceClockInToday(employee.worker) && !absentWorkers.has(employee.worker))
+        .filter((employee) => (crewVacationHasWork(employee.worker) || (crewVacationAlertsAvailable() && !crewVacationFor(employee.worker))) && !hasAttendanceClockInToday(employee.worker) && !absentWorkers.has(employee.worker))
         .map((employee) => ({
           worker: employee.worker,
           status: "Not Clocked In",
@@ -2258,7 +2586,7 @@ function buildAlertSections() {
       people: failed.concat(pending)
         .map((shift) => ({
           worker: shift.worker,
-          status: shift.syncStatus === "pending" ? "Pending Save" : "Save Failed",
+          status: syncLabel(shift),
           statusClass: shift.syncStatus === "pending" ? "pending" : "failed",
           detail: shift.error || (shift.syncStatus === "pending" ? "Waiting to save" : "Save failed, try again"),
         }))
@@ -2439,15 +2767,11 @@ function renderJobsiteSelect(select, selectedValue, options = {}) {
 }
 
 function syncStatusText() {
-  const rows = completedRowsFor();
-  const failed = rows.filter((shift) => shift.syncStatus === "failed").length;
-  const pending = rows.filter((shift) => shift.syncStatus === "pending").length;
-  const scheduleFailed = state.scheduleReports.filter((report) => report.syncStatus === "failed").length;
-  const schedulePending = state.scheduleReports.filter((report) => report.syncStatus === "pending").length;
-  if (failed) return "Save failed, try again";
-  if (scheduleFailed) return "Clock out saved. Crew schedule not synced.";
-  if (pending) return "Saving";
-  if (schedulePending) return "Saving crew schedule";
+  if (offlineError) return "Needs Attention — " + offlineError;
+  const rows = state.shifts.filter(s => s.worker === currentWorker());
+  if (rows.some(s => s.syncStatus === "failed")) return "Needs Attention — local records retained; Retry Saves or contact office";
+  const count = rows.filter(s => s.syncStatus !== "saved").length;
+  if (count) return `Pending Sync — ${count} recorded on this device`;
   return state.lastSync || "Ready";
 }
 
@@ -2558,9 +2882,7 @@ function travelLabel(shift) {
 }
 
 function syncLabel(shift) {
-  if (shift.syncStatus === "saved") return "Saved";
-  if (shift.syncStatus === "failed") return "Save failed";
-  return "Saving";
+  return shift.syncStatus === "saved" ? "Saved" : shift.syncStatus === "failed" ? "Needs Attention" : "Pending Sync";
 }
 
 function syncClass(shift) {
@@ -2575,6 +2897,10 @@ function findJobsite(name) {
 }
 
 function setConnection(mode, message) {
+  if (mode === "ready" && !serverVerifiedV30()) {
+    mode = "error";
+    message = recoveryV30.error || "Server connection not verified. Local records retained; reconnect or refresh.";
+  }
   els.connectionBar.className = `connection-bar ${mode === "ready" ? "ready" : mode === "error" ? "error" : ""}`;
   const statusText = mode === "ready"
     ? "Connected to Payroll 2.0"
@@ -2667,9 +2993,477 @@ function escapeAttribute(value) {
   return "#007f73";
 }
 
+
+function scheduleConfirmationV30(report) {
+  return Object.fromEntries(["id", "worker", "role", "date", "jobsite", "scheduledStart", "scheduledEnd", "reportedAt", "source", "sourceSessionId", "deviceId"].map(k => [k, report[k] || ""]));
+}
+function storageFailureV30(error) {
+  offlineError = error?.message || "Local storage failed. Clock-out was NOT confirmed locally.";
+  setConnection("error", "Needs Attention — " + offlineError);
+  showToast("Needs Attention — " + offlineError);
+  render();
+}
+async function initializeOffline() {
+  await outbox.open();
+  // Request durable storage when supported; refusal never deletes or resets records.
+  if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+  const legacyRaw = localStorage.getItem(STORAGE_KEY);
+  const legacy = legacyRaw ? JSON.parse(legacyRaw) : {};
+  const migrationHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(CrewClockOutbox.stable({ shifts: legacy.shifts || [], scheduleReports: legacy.scheduleReports || [], deviceId: legacy.deviceId || "" }))))).map(b => b.toString(16).padStart(2, "0")).join("");
+  const migrated = await outbox.meta("migration-v29-complete");
+  if (migrated?.snapshotHash !== migrationHash) {
+    if (legacyRaw) {
+      for (const oldShift of legacy.shifts || []) {
+        if (!oldShift.end) continue;
+        const schedule = (legacy.scheduleReports || []).find(r => r.linkedShiftId === oldShift.id);
+        const shift = { ...oldShift, deviceId: legacy.deviceId || "", ...(schedule ? { crewSchedule: schedule } : {}) };
+        try {
+          await outbox.enqueue(shift, toSubmissionPayload(shift), schedule ? toCrewSchedulePayload(schedule, shift, "") : null, { verifyOnly: oldShift.syncStatus === "saved" });
+        } catch (error) {
+          // Conflicting variants were committed to quarantine. Incomplete records stay in untouched V29 storage.
+          if (!/Conflicting records/.test(error.message)) throw error;
+        }
+      }
+    }
+    await outbox.meta("migration-v29-complete", { completedAt: new Date().toISOString(), snapshotHash: migrationHash });
+  }
+  // If the database was lost but the separate UI backup survives, recover missing entries without replacing existing ones.
+  const known = new Set((await outbox.list()).map(r => r.key));
+  for (const shift of state.shifts || []) {
+    if (!shift.end || known.has(JSON.stringify([shift.worker, shift.id]))) continue;
+    const schedule = shift.crewSchedule || (state.scheduleReports || []).find(r => r.linkedShiftId === shift.id);
+    const copy = { ...shift, deviceId: shift.deviceId || state.deviceId, ...(schedule ? { crewSchedule: schedule } : {}) };
+    try { await outbox.enqueue(copy, toSubmissionPayload(copy), schedule ? toCrewSchedulePayload(schedule, copy, "") : null, { verifyOnly: shift.syncStatus === "saved" }); }
+    catch (error) { if (!/Conflicting records/.test(error.message)) throw error; }
+  }
+  const cache = state.auth ? await outbox.meta("bootstrap:" + currentWorker()) : null;
+  if (cache) { payroll = { ...payroll, ...cache }; offlineClockInGrant = cache.offlineClockInGrant || null; }
+  await hydrateOutboxV30();
+  offlineReady = true;
+  render();
+  if (state.auth) {
+    await loadBootstrap();
+    await syncOutbox();
+  }
+}
+async function hydrateOutboxV30() {
+  const entries = (await outbox.list()).sort((a,b) => Date.parse(a.shift.end) - Date.parse(b.shift.end));
+  for (const entry of entries) {
+    const shift = { ...entry.shift, syncStatus: entry.status === "saved" ? "saved" : entry.status === "attention" ? "failed" : "pending",
+      error: entry.error || "", submissionId: entry.receipt?.submissionId || "" };
+    state.shifts = state.shifts.filter(s => !(s.worker === shift.worker && s.id === shift.id));
+    state.shifts.push(shift);
+    if (shift.crewSchedule) {
+      queueCrewScheduleReport({ ...shift.crewSchedule, syncStatus: shift.syncStatus, error: shift.error });
+    }
+    // Recover local side effects after a process was killed just after IndexedDB commit.
+    if (state.activeShifts[shift.worker]?.id === shift.id) applyCompletedShiftSideEffects(shift);
+  }
+  const starts = (await clockIns.list()).sort((a,b)=>Date.parse(a.shift.start)-Date.parse(b.shift.start));
+  clockInSnapshot = starts;
+  for (const entry of starts) {
+    const shift=entry.shift;
+    if (state.shifts.some(s=>s.worker===shift.worker&&s.id===shift.id)) continue;
+    const active=state.activeShifts[shift.worker];
+    if (!active || active.id===shift.id || Date.parse(active.start)<Date.parse(shift.start)) state.activeShifts[shift.worker]={...shift,clockInSyncStatus:entry.status};
+  }
+  state.shifts.sort((a,b) => Date.parse(b.end) - Date.parse(a.end));
+}
+async function sendOutboxV30(action, payload, worker, token) {
+  if (!state.auth || currentWorker() !== worker || state.auth.token !== token) throw Object.assign(new Error("Sign in as the original worker to sync this record."), { needsAttention: true });
+  if (authExpiredV30() || recoveryV30.renewalWorker) {
+    const error = new Error("Session expired. Renew sign-in as the original worker. Records retained.");
+    recoveryFailureV30(error); throw error;
+  }
+  // Bound the entire response, including body parsing. Original payload stays immutable after timeout.
+  let timer;
+  try {
+    return await Promise.race([
+      apiPost(action, { ...payload, token }),
+      new Promise((_, reject) => { timer = window.setTimeout(() => reject(new Error("Server receipt timed out. Original clock-out retained for retry.")), 25000); })
+    ]);
+  } finally { window.clearTimeout(timer); }
+}
+async function syncCompletedOutboxV30(manual = false) {
+  if (!offlineReady || !state.auth || navigator.onLine === false) return;
+  if (authExpiredV30() || recoveryV30.renewalWorker) { recoveryFailureV30(new Error("Session expired. Sign in again.")); return; }
+  const worker = currentWorker(), token = state.auth.token;
+  try {
+    await outbox.drain(worker, async (action, payload) => {
+      if (action === "saveShift" && payload.shift.requiresClockInReceipt) {
+        const start = (await clockIns.list()).find(e=>e.immutable.payload.worker===worker && e.immutable.payload.clientShiftId===payload.shift.clientShiftId);
+        if (!start || start.status!=="saved") throw Object.assign(new Error("Clock-in is awaiting a verified receipt. Original clock-out retained."),{needsAttention:!start || start.status==="attention"});
+      }
+      return sendOutboxV30(action,payload,worker,token);
+    }, {
+      manual,
+      canSend: w => !!state.auth && currentWorker() === w && state.auth.token === token && navigator.onLine !== false,
+      onChange: async () => { await hydrateOutboxV30(); saveState(); render(); },
+      onError: (error, entry) => {
+        if (isSessionExpiredError(error)) setConnection("error", "Needs Attention — sign in again to sync. Original records retained.");
+        // Preserve V29 best-effort manager save-problem alerts; never block the durable queue on push delivery.
+        if (navigator.onLine !== false && state.auth?.token === token && currentWorker() === worker) {
+          void (async () => {
+            const noticeKey = "save-problem:" + entry.key;
+            if (await outbox.meta(noticeKey)) return;
+            await sendOutboxV30("notifySaveProblem", { shift: entry.immutable.payload, error: error.message }, worker, token);
+            await outbox.meta(noticeKey, { notifiedAt: new Date().toISOString() });
+          })().catch(() => {});
+        }
+      }
+    });
+    await hydrateOutboxV30();
+    if (!state.shifts.some(s => s.worker === worker && s.syncStatus !== "saved") && !(await clockIns.list()).some(e=>e.shift.worker===worker&&e.status!=="saved")) {
+      state.lastSync = "Saved to Payroll 2.0";
+      // Queue state is not evidence of a live server connection.
+      if (serverVerifiedV30()) setConnection("ready", state.lastSync);
+    }
+    saveState();
+    render();
+  } catch (error) { storageFailureV30(error); }
+}
+function resumeOfflineSync() {
+  if (document.hidden) return;
+  // Run update discovery even if the employee or website sign-in needs renewal.
+  if (appUpdatesV30) void appUpdatesV30.checkNow();
+  else if (!serviceWorkerRegistration) void registerServiceWorker();
+  if (recoveryV30.resume) return recoveryV30.resume;
+  recoveryV30.resume = (async () => {
+    if (navigator.onLine === false) { setConnection("error", "Offline — local records retained."); return; }
+    if (!offlineReady || !state.auth) return;
+    await loadBootstrap({quiet:true});
+    refreshMyHoursFromAppResume();
+    if (!recoveryV30.renewalWorker) await syncOutbox();
+  })().finally(() => { recoveryV30.resume = null; });
+  return recoveryV30.resume;
+}
+
+const SYNC_PANEL_HTML_V30 = "<section class=\"my-hours-panel\" id=\"syncQueuePanel\" aria-label=\"Clock-out synchronization\">\n  <div class=\"section-heading\"><h2>Clock-out sync</h2><button class=\"text-button\" id=\"retryClockSavesButton\" type=\"button\">Retry Sync</button></div>\n  <p id=\"queueSummary\" role=\"status\" aria-live=\"polite\">Preparing local storage\u2026</p>\n  <div id=\"queueDetails\" class=\"timeline-list\"></div>\n</section>";
+
+function ensureSyncPanelV30() {
+  if (!document.querySelector("#syncQueuePanel")) {
+    const holder = document.createElement("div");
+    holder.innerHTML = SYNC_PANEL_HTML_V30;
+    els.reminderPanel.before(holder.firstElementChild);
+  }
+  document.querySelector("#retryClockSavesButton").addEventListener("click", retryFailedSaves);
+}
+function renderCompletedSyncPanelV30() {
+  const summary = document.querySelector("#queueSummary");
+  if (!summary) return;
+  const rows = state.shifts.filter(s => s.worker === currentWorker());
+  const pending = rows.filter(s => s.syncStatus !== "saved");
+  summary.textContent = offlineError ? "Needs Attention — " + offlineError : !offlineReady ? "Preparing safe local storage…" : pending.some(s => s.syncStatus === "failed") ? "Needs Attention — original records retained on this device." : pending.length ? `Pending Sync — ${pending.length} clock-out${pending.length === 1 ? "" : "s"} recorded on this device. ${navigator.onLine === false ? "Will retry when connected." : "Automatic retry is enabled."}` : rows.length ? "Saved — recorded clock-outs confirmed by Payroll 2.0." : "No clock-outs waiting to sync.";
+  document.querySelector("#retryClockSavesButton").disabled = !offlineReady || localCaptureBusy || navigator.onLine === false;
+  document.querySelector("#queueDetails").innerHTML = (pending.length ? pending : rows.slice(0, 1)).map(shift => `
+    <article class="entry-card">
+      <div class="entry-main"><div>
+        <span class="entry-title">${escapeHtml(shift.jobsite)}</span>
+        <span class="entry-sub">${escapeHtml(localDateKey(new Date(shift.start)))} · ${timeLabel(shift.start)} – ${timeLabel(shift.end)}</span>
+        <span class="entry-sub">Lunch: ${escapeHtml(shift.lunch)}</span>
+        ${shift.crewSchedule ? `<span class="entry-sub">Crew schedule: ${escapeHtml(shift.crewSchedule.scheduledStart)} – ${escapeHtml(shift.crewSchedule.scheduledEnd)}</span>` : ""}
+        ${shift.error ? `<span class="entry-sub">${escapeHtml(shift.error)}</span>` : ""}
+      </div><span class="mini-pill ${syncClass(shift)}">${syncLabel(shift)}</span></div>
+    </article>`).join("");
+}
+
+
+async function readOnlyRequestV30(action,payload,canContinue=()=>true) {
+  if(!["login","bootstrap","myHours"].includes(action))throw new Error("Automatic read retry is not permitted for this action.");
+  for(let attempt=0;attempt<2;attempt++){
+    if(!canContinue())throw new Error("Sign-in changed; previous response ignored.");
+    try {
+      const data=await apiPost(action,payload,{boundedRead:true});
+      if(!canContinue())throw new Error("Sign-in changed; previous response ignored.");
+      return data;
+    } catch(error) {
+      if(!canContinue()||attempt||navigator.onLine===false||!(error.isNetworkError||error.retryable))throw error;
+      await new Promise(resolve=>window.setTimeout(resolve,750));
+    }
+  }
+}
+
+
+async function tokenDigestV30(token) {
+  const bytes=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,"0")).join("");
+}
+function offlineClockInAllowedV30() {
+  const grant=offlineClockInGrant;
+  return !!(state.auth&&grant&&grant.worker===currentWorker()&&Number.isFinite(grant.expiresAt)&&Date.now()<grant.expiresAt&&Date.now()>=grant.checkedAt&&Date.now()-grant.checkedAt<86400000&&payroll.employees.some(e=>e.worker===currentWorker())&&payroll.jobsites.length);
+}
+function clockInPayloadV30(shift) {
+  return {clientShiftId:shift.id,worker:shift.worker,date:localDateKey(new Date(shift.start)),jobsite:shift.jobsite,startIso:shift.start,deviceId:shift.deviceId};
+}
+function renderSyncPanelV30() {
+  renderCompletedSyncPanelV30();
+  const pending=clockInSnapshot.filter(e=>e.shift.worker===currentWorker()&&e.status!=="saved");
+  if(!pending.length)return;
+  const summary=document.querySelector("#queueSummary");
+  if(summary)summary.textContent=(pending.some(e=>e.status==="attention"||e.blocked)?"Needs Attention":"Pending Sync")+" — "+pending.length+" clock-in(s) retained on this device. "+summary.textContent;
+  const details=document.querySelector("#queueDetails");
+  if(details)details.innerHTML+=pending.map(e=>`<article class="entry-card"><div class="entry-main"><div><span class="entry-title">Clock-in: ${escapeHtml(e.shift.jobsite)}</span><span class="entry-sub">${escapeHtml(localDateKey(new Date(e.shift.start)))} · ${timeLabel(e.shift.start)}</span><span class="entry-sub">${escapeHtml(e.error||"")}</span></div><span class="mini-pill">${e.status==="attention"?"Needs Attention":"Pending Sync"}</span></div></article>`).join("");
+}
+async function syncOutbox(manual=false) {
+  if (!offlineReady||!state.auth||navigator.onLine===false) return;
+  if (authExpiredV30() || recoveryV30.renewalWorker) { recoveryFailureV30(new Error("Session expired. Sign in again.")); return; }
+  if (clockSyncRunning) return clockSyncRunning;
+  const worker=currentWorker(),token=state.auth.token;
+  clockSyncRunning=(async()=>{
+    try {
+      // Interleave starts and ends chronologically; never open a later session over an unsaved prior one.
+      const count=(await clockIns.list()).filter(e=>e.immutable.payload.worker===worker&&e.status!=="saved").length;
+      for(let i=0;i<=count;i++) {
+        if(state.auth?.token!==token||currentWorker()!==worker||navigator.onLine===false)break;
+        const pending=(await clockIns.list()).filter(e=>e.immutable.payload.worker===worker&&e.status!=="saved").sort((a,b)=>Date.parse(a.shift.start)-Date.parse(b.shift.start))[0];
+        if(pending){
+          const prior=(await clockIns.list()).filter(e=>e.shift.worker===worker&&e.shift.id!==pending.shift.id&&Date.parse(e.shift.start)<=Date.parse(pending.shift.start));
+          const ends=await outbox.list();
+          const blocked=prior.some(e=>!ends.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&end.status==="saved"));
+          if(blocked){
+            await syncCompletedOutboxV30(manual);
+            const refreshed=await outbox.list();
+            if(prior.some(e=>!refreshed.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&end.status==="saved")))break;
+          }
+          // A different tab may hold the earliest start. Do not skip it and open a later one.
+          const exclude=new Set((await clockIns.list()).filter(e=>e.key!==pending.key).map(e=>e.key));
+          await clockIns.drain(worker,(a,p)=>sendOutboxV30(a,p,worker,token),{manual,maxEntries:1,exclude,canSend:()=>state.auth?.token===token&&currentWorker()===worker&&navigator.onLine!==false});
+        }
+        await syncCompletedOutboxV30(manual);
+        if(!pending)break;
+        const after=(await clockIns.list()).find(e=>e.key===pending.key);
+        if(after.status!=="saved")break;
+        const completed=(await outbox.list()).find(e=>e.shift.worker===worker&&e.shift.id===pending.shift.id);
+        if(!completed||completed.status!=="saved")break;
+      }
+      await hydrateOutboxV30();saveState();render();
+    } catch(error){storageFailureV30(error);}
+  })().finally(()=>{clockSyncRunning=null;});
+  return clockSyncRunning;
+}
+
 setup();
 
 window.addEventListener("beforeunload", () => {
+  if (syncTimer) window.clearInterval(syncTimer);
   if (renderTimer) window.clearInterval(renderTimer);
   if (operationsRefreshTimer) window.clearInterval(operationsRefreshTimer);
 });
+
+async function reconcileRestoredActiveV30(proof, worker, token) {
+  if(!proof||proof.verified!==true||proof.readOnly!==true)return;
+  const active=state.activeShifts?.[worker],receipt=proof.receipt,p=receipt?.payload;
+  if(!active?.restored||!p||receipt.version!==30||receipt.sessionId!==active.id||p.clientShiftId!==active.id||p.worker!==worker||p.jobsite!==active.jobsite||p.startIso!==active.start||!p.endIso)return;
+  const expected='CC-'+p.date.replaceAll('-','')+'-'+active.id.replace(/[^a-zA-Z0-9]/g,'').slice(0,24);
+  if(receipt.submissionId!==expected||!Number.isFinite(Date.parse(p.endIso))||Date.parse(p.endIso)<Date.parse(active.start))return;
+  const same=()=>state.auth?.token===token&&currentWorker()===worker&&state.activeShifts?.[worker]===active;
+  const starts=await clockIns.list(),ends=await outbox.list();
+  // This repair is exclusively for server-restored display state, never a local queue.
+  if(!same()||starts.some(e=>e.shift.worker===worker&&e.shift.id===active.id)||ends.some(e=>e.shift.worker===worker&&e.shift.id===active.id))return;
+  await outbox.meta('reconciled-restored:'+JSON.stringify([worker,active.id]),{active:{...active},proof,reconciledAt:new Date().toISOString()});
+  if(!same())return;
+  delete state.activeShifts[worker];
+  showToast('This restored shift was already saved on the server. Its receipt is preserved.');
+}
+
+function markOperationsReadV30(phase, worker, token, data = null, error = "") {
+  if (state.auth?.token !== token || currentWorker() !== worker) return;
+  const prior = operationsReadV30.worker === worker && operationsReadV30.token === token
+    ? operationsReadV30 : { worker, token, loadedAt: null, day: "", loading: false, error: "" };
+  if (phase === "loading") operationsReadV30 = { ...prior, loading: true, error: "" };
+  if (phase === "success") {
+    const complete = data?.capabilities?.canUseOperations === true
+      && ["employees", "clockStates", "submissions", "absences"].every(key => Array.isArray(data[key]));
+    operationsReadV30 = { worker, token, loadedAt: complete ? new Date().toISOString() : null,
+      day: complete ? data.today || todayKey() : "", loading: false,
+      error: complete ? "" : "Complete team data was not returned. Refresh Operations to try again." };
+  }
+  if (phase === "error" && prior.loading) operationsReadV30 = { ...prior, loading: false, error: error || "Team data could not be refreshed." };
+}
+function operationsFreshnessV30() {
+  const read = operationsReadV30;
+  const same = read.worker === currentWorker() && read.token === state.auth?.token;
+  const hasComplete = same && !!read.loadedAt && read.day === todayKey();
+  const offline = navigator.onLine === false;
+  let status = "unavailable", message;
+  const last = hasComplete ? new Intl.DateTimeFormat([], {dateStyle:"medium",timeStyle:"medium",timeZone:APP_TIME_ZONE}).format(new Date(read.loadedAt)) : "Never";
+  if (offline) { status = "stale"; message = hasComplete ? "Offline — showing the last complete team data." : "Offline — complete team data is unavailable. Local employee records are not team totals."; }
+  else if (same && read.loading) { status = "loading"; message = hasComplete ? "Refreshing Operations — showing the last complete team data." : "Loading complete team data…"; }
+  else if (same && read.error) { status = "error"; message = hasComplete ? "Operations refresh failed — showing stale team data. Automatic retry is enabled." : "Operations could not load complete team data. Automatic retry is enabled."; }
+  else if (hasComplete && Date.now() - Date.parse(read.loadedAt) <= OPERATIONS_REFRESH_MS * 2) { status = "current"; message = "Operations refreshed successfully."; }
+  else if (hasComplete) { status = "stale"; message = "Team data is stale — waiting for the next successful refresh."; }
+  else message = "Complete team data is unavailable. Refresh Operations to try again.";
+  return {status,hasComplete,lastSuccessfulAt:hasComplete?read.loadedAt:null,message:message+" Last successful refresh: "+last+"."};
+}
+function renderOperationsFreshnessV30() {
+  const view = operationsFreshnessV30();
+  let panel = document.querySelector("#operationsFreshness");
+  if (!panel) {
+    panel = document.createElement("p");panel.id = "operationsFreshness";
+    panel.setAttribute("role","status");panel.setAttribute("aria-live","polite");panel.className="muted";
+    document.querySelector("#operationsView .team-head").after(panel);
+  }
+  panel.textContent = view.message;panel.dataset.status = view.status;
+  document.querySelector("#operationsView").setAttribute("aria-busy",view.status === "loading" ? "true" : "false");
+  if (els.refreshButton) els.refreshButton.disabled = view.status === "loading";
+  return view;
+}
+
+/* Update UI only. No payroll writes, storage migration, cache deletion or automatic reload. */
+const CrewClockUpdatesV30 = (() => {
+  function create({registration, readProtection, online, reload, freeze, document: doc = document, events = window}) {
+    let checking = null, applying = false, available = !!registration.waiting;
+    const originalWorker=registration.active;
+    const panel=doc.createElement('section');panel.id='appUpdatePanel';panel.setAttribute('aria-label','App update');
+    const message=doc.createElement('p');message.setAttribute('role','status');message.setAttribute('aria-live','polite');
+    const check=doc.createElement('button');check.type='button';check.textContent='Check for updates';
+    const apply=doc.createElement('button');apply.type='button';apply.textContent='Update ready — open updated app';apply.hidden=true;
+    const version=doc.createElement('p');version.textContent='Crew Clock V30 · Recovery 1';panel.append(version,message,check,apply);doc.body.append(panel);
+    async function protection(){try{return await readProtection() || '';}catch{return 'Local storage could not be verified. Update deferred; existing records are retained.';}}
+    async function paint(){available=available||!!registration.waiting||!!(originalWorker&&registration.active&&registration.active!==originalWorker);apply.hidden=!available;const reason=await protection();apply.disabled=applying||!!reason||!online();check.disabled=applying;message.textContent=available?('Update ready. '+(reason||(!online()?'Reconnect before updating.':'Tap to update when you are ready. Your saved records will be retained.'))):'App update checks preserve your existing records.';}
+    function observe(worker){if(!worker)return;worker.addEventListener('statechange',()=>{if(originalWorker&&worker!==originalWorker&&['installed','activating','activated'].includes(worker.state)){available=true;void paint();}});}
+    registration.addEventListener('updatefound',()=>observe(registration.installing));observe(registration.installing);
+    async function checkNow(){if(!online()||checking||applying)return checking;checking=(async()=>{try{message.textContent='Checking for app updates…';await registration.update();await paint();if(!available)message.textContent=registration.installing?'Downloading app update. Your current app and records remain available.':'No update is waiting. Checks will run again when you reopen or reconnect.';}catch{message.textContent='Update check failed. Your current app and records are retained. Try again online.';}finally{checking=null;}})();return checking;}
+    async function applyNow(){if(applying||!available||!online())return;applying=true;freeze(true);
+      try{
+        let reason=await protection();if(reason)throw Error(reason);
+        const worker=registration.waiting||registration.installing||(registration.active!==originalWorker?registration.active:null);
+        if(worker&&worker.state!=='activated'){await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>{worker.removeEventListener('statechange',changed);reject(Error('Update not activated. Please try again later.'));},10000);function changed(){if(worker.state==='activated'){clearTimeout(timeout);worker.removeEventListener('statechange',changed);resolve();}else if(worker.state==='redundant'){clearTimeout(timeout);worker.removeEventListener('statechange',changed);reject(Error('Update unavailable. Existing records retained.'));}}worker.addEventListener('statechange',changed);worker.postMessage({type:'V30_ACTIVATE_UPDATE'});changed();});}
+        if(originalWorker&&registration.active===originalWorker)throw Error('The update is still preparing. Please try again shortly.');
+        reason=await protection();if(reason||!online())throw Error(reason||'Connection lost. Update deferred.');
+        // This is the only reload path: explicit tap, activation complete, all guards still clear.
+        reload();
+      }catch(error){message.textContent='Update deferred. '+error.message;}
+      finally{applying=false;freeze(false);apply.disabled=false;}
+    }
+    check.addEventListener('click',()=>void checkNow());apply.addEventListener('click',()=>void applyNow());
+    events.addEventListener('focus',()=>void checkNow());events.addEventListener('online',()=>void checkNow());events.addEventListener('pageshow',()=>void checkNow());
+    doc.addEventListener('visibilitychange',()=>{if(!doc.hidden)void checkNow();});
+    events.navigator?.serviceWorker?.addEventListener('controllerchange',()=>{available=available||!!registration.waiting||!!(originalWorker&&registration.active!==originalWorker);void paint();});
+    const timer=setInterval(()=>{if((available||registration.waiting||(originalWorker&&registration.active!==originalWorker))&&!applying)void paint();},1000);void paint();void checkNow();
+    return {checkNow,applyNow,paint,dispose(){clearInterval(timer);},panel};
+  }
+  return {create};
+})();
+let appUpdatesV30 = null;
+let updateInputFrozenV30 = false;
+async function updateProtectionV30() {
+  if (recoveryV30.renewing || recoveryV30.resume || bootstrapLoading) return "A connection or sign-in check is in progress.";
+  if(!offlineReady||offlineError)return 'Local storage is not ready or needs attention.';
+  if(localCaptureBusy||clockSyncRunning||outbox.running||clockIns.running)return 'A save or synchronization is in progress.';
+  if(Object.values(state.activeShifts||{}).some(Boolean))return 'Finish the active shift and let it sync before updating.';
+  if(pendingClockOutShiftId||pendingSwitchShiftId||pendingCrewScheduleShiftId||pendingRemoveAbsenceWorker)return 'Finish or cancel the open form before updating.';
+  if([...document.querySelectorAll('dialog[open], [role="dialog"]')].some(node=>node.getClientRects().length&&getComputedStyle(node).visibility!=='hidden'))return 'Finish or cancel the open form before updating.';
+  if((state.scheduleReports||[]).some(r=>r.syncStatus&&r.syncStatus!=='saved'))return 'A schedule report still needs synchronization.';
+  const [ends,starts]=await Promise.all([outbox.list(),clockIns.list()]);
+  if([...ends,...starts].some(e=>e.status!=='saved'))return 'Pending Sync or Needs Attention records must be resolved before updating.';
+  if(starts.some(start=>!ends.some(end=>end.shift.id===start.shift.id&&end.shift.worker===start.shift.worker&&end.status==='saved')))return 'A locally stored shift has no saved clock-out yet.';
+  const latest=localStorage.getItem(V30_UI_KEY);
+  if(latest&&Object.values(JSON.parse(latest).activeShifts||{}).some(Boolean))return 'An active shift is stored on this device.';
+  if(localCaptureBusy||clockSyncRunning||outbox.running||clockIns.running||Object.values(state.activeShifts||{}).some(Boolean))return 'A shift or save started. Update deferred.';
+  return '';
+}
+function installUpdateSafetyV30(registration) {
+  if(appUpdatesV30)return;
+  for(const event of ['click','keydown','submit'])document.addEventListener(event,e=>{if(updateInputFrozenV30){e.preventDefault();e.stopImmediatePropagation();}},true);
+  appUpdatesV30=CrewClockUpdatesV30.create({registration,readProtection:updateProtectionV30,online:()=>navigator.onLine!==false,reload:()=>location.reload(),freeze:value=>{updateInputFrozenV30=value;}});
+}
+
+
+// Recovery UI never removes credentials, changes worker identity, or mutates queued payloads.
+function authExpiredV30() {
+  if (!state.auth?.token) return false;
+  try {
+    const payload = JSON.parse(atob(state.auth.token.split('.')[0].replace(/-/g,'+').replace(/_/g,'/')));
+    return Number.isFinite(payload.exp) && Date.now() >= payload.exp;
+  } catch { return false; } // Only the server can validate an opaque/legacy credential.
+}
+function serverVerifiedV30() {
+  return navigator.onLine !== false && !!state.auth && !authExpiredV30()
+    && !recoveryV30.renewalWorker && !recoveryV30.error
+    && recoveryV30.token === state.auth.token && Date.now() - recoveryV30.verifiedAt < 90000;
+}
+function recoveryFailureV30(error) {
+  recoveryV30.error = error?.message || "Server connection failed. Local records retained.";
+  recoveryV30.verifiedAt = 0;
+  if (isSessionExpiredError(error) || /invalid.*token|unauthorized/i.test(error?.message || "")) {
+    recoveryV30.renewalWorker = currentWorker();
+  }
+  renderRecoveryV30();
+}
+async function renewSignInV30(pin) {
+  if (recoveryV30.renewing || navigator.onLine === false || !state.auth) return;
+  const worker = currentWorker(), oldToken = state.auth.token;
+  let acceptedToken = oldToken;
+  recoveryV30.renewing = true;
+  renderRecoveryV30();
+  try {
+    const data = await readOnlyRequestV30("login", {pin}, () => currentWorker() === worker && state.auth?.token === oldToken);
+    if (currentWorker() !== worker || state.auth?.token !== oldToken) return;
+    if (!data.token || data.employee?.worker !== worker) throw Error("Use the PIN for " + worker + ". Existing records and identity are unchanged.");
+    const originalAuth = state.auth;
+    state.auth = {...originalAuth, token:data.token, expiresAt:data.expiresAt, signedInAt:new Date().toISOString()};
+    acceptedToken = data.token;
+    if (!saveState()) { state.auth = originalAuth; throw Error("Sign-in could not be stored. Original records retained; contact the office."); }
+    recoveryV30.renewalWorker = ""; recoveryV30.error = ""; recoveryV30.token = null;
+    // No capture, migration, or queue rewrite. Existing receipt checks own all retries.
+    await loadBootstrap();
+    if (serverVerifiedV30()) await syncOutbox();
+  } catch (error) {
+    if (currentWorker() !== worker || ![oldToken,acceptedToken].includes(state.auth?.token)) return;
+    recoveryV30.error = error.message || "Sign-in renewal failed. Records retained.";
+  } finally { recoveryV30.renewing = false; renderRecoveryV30(); }
+}
+function renderRecoveryV30() {
+  if (!state.auth) return;
+  let panel = document.querySelector('#signInRecoveryV30');
+  if (!panel) {
+    panel = document.createElement('section'); panel.id = 'signInRecoveryV30'; panel.setAttribute('aria-label','Connection recovery');
+    const message = document.createElement('p'); message.setAttribute('role','status');
+    const pin = document.createElement('input'); pin.type='password'; pin.inputMode='numeric'; pin.maxLength=4; pin.autocomplete='off'; pin.setAttribute('aria-label','Your employee PIN');
+    const renew = document.createElement('button'); renew.type='button'; renew.textContent='Renew sign-in — keep my records';
+    renew.addEventListener('click',()=>{const value=pin.value;pin.value='';if(/^\d{4}$/.test(value))void renewSignInV30(value);});
+    const retry = document.createElement('button'); retry.type='button'; retry.textContent='Reconnect'; retry.addEventListener('click',()=>void resumeOfflineSync());
+    panel.append(message,pin,renew,retry); els.appShell.prepend(panel);
+  }
+  const [message,pin,renew,retry] = panel.children;
+  panel.hidden = !recoveryV30.error && !recoveryV30.renewalWorker;
+  message.textContent = recoveryV30.renewalWorker
+    ? 'Renew sign-in as '+recoveryV30.renewalWorker+'. Saved and unsent records remain on this device. '+(isSessionExpiredError({message:recoveryV30.error})?'':recoveryV30.error)
+    : recoveryV30.error + ' Your local records are retained. Reconnect to retry; if website access expired, unlock the same website without resetting this app.';
+  pin.hidden=renew.hidden=!recoveryV30.renewalWorker;
+  renew.disabled=recoveryV30.renewing || navigator.onLine===false;
+  retry.disabled=!!recoveryV30.resume || navigator.onLine===false;
+}
+
+
+// Vacation is a server-read projection, never a clock or scheduling record.
+function mergeCrewVacations(incoming, previous) {
+  const valid = incoming?.status === "available" && incoming.date === todayKey()
+    && Array.isArray(incoming.items) && incoming.items.every(v => v && typeof v.worker === "string"
+      && /^\d{4}-\d{2}-\d{2}$/.test(v.start) && /^\d{4}-\d{2}-\d{2}$/.test(v.end)
+      && v.start <= incoming.date && v.end >= incoming.date);
+  if (valid) return {status: "available", date: incoming.date,
+    items: incoming.items.map(v => ({employeeId:v.employeeId, worker:v.worker, start:v.start, end:v.end})), lastSuccessfulAt:new Date().toISOString()};
+  return {status: "unavailable", date: todayKey(), items:previous?.date === todayKey() ? previous.items || [] : [],
+    lastSuccessfulAt:previous?.date === todayKey() ? previous.lastSuccessfulAt : null};
+}
+function crewVacationFor(worker) {
+  const view = payroll.vacations;
+  return view?.date === todayKey() ? view.items.find(v => v.worker === worker) || null : null;
+}
+function crewVacationAlertsAvailable() {
+  return payroll.vacations?.status === "available" && payroll.vacations.date === todayKey()
+    && operationsFreshnessV30().status === "current";
+}
+function crewVacationHasWork(worker) {
+  return !!state.activeShifts[worker] || state.shifts.some(s => s.worker === worker && localDateKey(new Date(s.start)) === todayKey())
+    || payroll.submissions.some(s => s.worker === worker && s.date === todayKey())
+    || payroll.clockStates.some(s => s.worker === worker && s.date === todayKey() && ["Clocked In","Clocked Out"].includes(s.status));
+}
+function crewVacationNotice() {
+  const view = payroll.vacations, fresh = crewVacationAlertsAvailable();
+  if (fresh) return "";
+  const retained = view?.date === todayKey() && view?.lastSuccessfulAt;
+  return `<p class="vacation-notice" role="status">${retained ? "Vacation data is stale — showing the last successful vacation read." : "Vacation data is unavailable."} Vacation-related missing-attendance decisions are paused until a fresh read succeeds.</p>`;
+}

@@ -1532,3 +1532,5 @@ textarea {
   color: #9a6700;
   border-color: #f2c94c;
 }
+
+.vacation-dates{display:block;font-size:.78rem;white-space:normal;overflow-wrap:anywhere}.mini-pill.vacation{background:#eee8f7;color:#553282}.vacation-conflict{background:#fff1db;color:#7a4300}.vacation-notice{padding:.75rem;border:1px solid #b78328;border-radius:.5rem;font-size:.85rem}

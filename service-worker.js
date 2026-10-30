@@ -1,39 +1,49 @@
-const CACHE_NAME = "pga-crew-clock-v7";
-const APP_SHELL = [
-  "./",
-  "./index.html",
-  "./styles.css",
-  "./app.js",
-  "./manifest.webmanifest",
-  "./assets/PINNACLE.png",
-  "./assets/app-icon-32-v2.png",
-  "./assets/app-icon-180-v2.png",
-  "./assets/app-icon-192-v2.png",
-  "./assets/app-icon-512-v2.png",
-  "./assets/app-icon-maskable-512-v2.png",
-];
-
-self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
-  );
+/* Production static shell only. No payroll data, authentication tokens or credentials. */
+const REVISION = "pga-crew-clock-v30-vacation-b-20261029";
+const CACHE = REVISION;
+const PREFIX = 'pga-crew-clock-v30-';
+const BASE = new URL('./', self.registration.scope);
+const url = path => new URL(path, BASE).href;
+const SHELL = ['./','index.html','app.js?v='+REVISION,'offline-outbox.js',
+  'styles.css?v='+REVISION,'manifest.webmanifest','assets/PINNACLE.png',
+  'assets/app-icon-32-v2.png','assets/app-icon-180-v2.png',
+  'assets/app-icon-192-v2.png','assets/app-icon-512-v2.png',
+  'assets/app-icon-maskable-512-v2.png'].map(url);
+const PATHS = new Set(SHELL.map(value => new URL(value).pathname));
+self.addEventListener('install', event => {
+  event.waitUntil((async () => {
+    const replies = await Promise.all(SHELL.map(value => fetch(new Request(value, {cache:'reload'}))));
+    if (replies.some(reply => !reply.ok)) throw Error('Incomplete release shell; current version retained.');
+    const cache = await caches.open(CACHE);
+    await Promise.all(replies.map((reply,i) => cache.put(SHELL[i],reply)));
+    await cache.put(url('.shell-complete'),new Response(REVISION));
+    // No skipWaiting here: existing pages/active shifts are not forced to update.
+  })());
 });
-
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
-      .then(() => self.clients.claim())
-  );
+self.addEventListener('activate', event => {
+  // Preserve old shell caches, all IndexedDB stores and all localStorage records.
+  event.waitUntil(self.clients.claim());
 });
-
-self.addEventListener("fetch", (event) => {
-  if (event.request.method !== "GET") return;
-  event.respondWith(
-    fetch(event.request).catch(() => caches.match(event.request).then((cached) => cached || caches.match("./index.html")))
-  );
+self.addEventListener('message', event => {
+  if (!event.source || !event.source.url?.startsWith(BASE.href)) return;
+  if (event.data?.type === 'V30_SHELL_VERSION') event.ports?.[0]?.postMessage({revision:REVISION});
+  if (event.data?.type === 'V30_ACTIVATE_UPDATE') event.waitUntil(self.skipWaiting());
+});
+async function fallback(request) {
+  const cache = await caches.open(CACHE);
+  if (!(await cache.match(url('.shell-complete')))) return Response.error();
+  const exact = await cache.match(request, {ignoreSearch:false});
+  if (exact) return exact;
+  if (request.mode === 'navigate') return await cache.match(url('index.html')) || Response.error();
+  return Response.error();
+}
+self.addEventListener('fetch', event => {
+  const target = new URL(event.request.url);
+  if (event.request.method !== 'GET' || target.origin !== BASE.origin || !PATHS.has(target.pathname)) return;
+  event.respondWith((async () => {
+    try { return await fetch(event.request); }
+    catch { return fallback(event.request); }
+  })());
 });
 
 self.addEventListener("push", (event) => {

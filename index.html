@@ -10,7 +10,7 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="32x32" href="./assets/app-icon-32-v2.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./assets/app-icon-180-v2.png" />
-    <link rel="stylesheet" href="./styles.css?v=20260723-my-hours" />
+    <link rel="stylesheet" href="./styles.css?v=pga-crew-clock-v30-vacation-b-20261029" />
     <script>
       window.CREW_CLOCK_CONFIG = {
         // Paste the Apps Script Web App URL after deploying CrewClockBackend.gs.
@@ -128,7 +128,7 @@
           <button class="secondary-button notification-button" id="notificationButton" type="button" hidden>🔔 ENABLE NOTIFICATIONS</button>
           <section class="clock-status-cards" aria-label="Today's clock status">
             <article class="clock-status-card">
-              <span>Clock In</span>
+              <span>Current shift start</span>
               <strong id="todayClockIn">Not Clocked In</strong>
             </article>
             <article class="clock-status-card" id="todayClockOutCard">
@@ -137,6 +137,12 @@
             </article>
           </section>
         </section>
+
+        <section class="my-hours-panel" id="syncQueuePanel" aria-label="Clock-out synchronization">
+  <div class="section-heading"><h2>Clock-out sync</h2><button class="text-button" id="retryClockSavesButton" type="button">Retry Sync</button></div>
+  <p id="queueSummary" role="status" aria-live="polite">Preparing local storage…</p>
+  <div id="queueDetails" class="timeline-list"></div>
+</section>
 
         <section class="reminder-panel" id="reminderPanel" aria-label="Clock reminders" hidden>
           <button class="secondary-button" id="enableRemindersButton" type="button">Enable Clock Reminders</button>
@@ -350,6 +356,6 @@
 
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-messaging-compat.js"></script>
-    <script src="./app.js?v=20260723-my-hours"></script>
+    <script src="./app.js?v=pga-crew-clock-v30-vacation-b-20261029"></script>
   </body>
 </html>
