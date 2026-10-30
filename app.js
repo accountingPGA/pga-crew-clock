@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-attendance-visibility-20261030";
+const APP_REVISION_V30 = "pga-crew-clock-v30-attendance-wording-20261030";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -2237,14 +2237,13 @@ function attendanceVisibilityViewV30() {
   const missing = (cache.snapshot?.missing || []).filter(e =>
     activeAttendanceEmployees().some(a => a.worker === e.worker) && !hasAttendanceClockInToday(e.worker)
       && !absent.has(e.worker) && !crewVacationFor(e.worker));
-  const cachedAt = cache.snapshot ? " Last verified: " + cache.snapshot.at + "." : "";
   const notice = verified ? "Verified current attendance." : freshness.status === "loading" && cache.snapshot
-    ? "Refreshing… Showing cached attendance counts." + cachedAt
-    : "Attendance alerts temporarily paused. " + (cache.snapshot ? "Showing cached attendance counts." : "No verified count available.") + cachedAt;
+    ? "Refreshing… Showing last verified attendance."
+    : "Attendance alerts temporarily paused. " + (cache.snapshot ? "Showing cached attendance counts." : "No verified count available.");
   const clockedIn = (cache.snapshot?.clockedIn || []).filter(e => !absent.has(e.worker)
     && !payroll.clockStates.some(r => r.worker === e.worker && r.date === todayKey() && r.status === "Clocked Out")
     && !state.shifts.some(r => r.worker === e.worker && localDateKey(new Date(r.start)) === todayKey() && r.end));
-  return {verified, missing, clockedIn, countKnown:!!cache.snapshot,
+  return {verified, missing, clockedIn, lastVerifiedAt:cache.snapshot?.at || null, countKnown:!!cache.snapshot,
     countLabel:verified ? "current" : cache.snapshot ? "cached" : "", notice};
 }
 function previousShiftReviewSectionV30() {
