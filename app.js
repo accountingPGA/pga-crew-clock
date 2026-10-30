@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-ui-cleanup-20261030";
+const APP_REVISION_V30 = "pga-crew-clock-v30-attendance-visibility-20261030";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -403,6 +403,7 @@ let bootstrapLoading = false;
 let bootstrapRequestToken = null;
 let bootstrapRequestOwner = null;
 let bootstrapRequestPromise = null;
+let attendanceVisibilityV30 = {scope: "", snapshot: null, reviews: null};
 let switchShiftProof = null;
 let loginRequestOwner = null;
 let myHoursRequestPromise = null;
@@ -673,6 +674,7 @@ async function performBootstrapV30(options = {}) {
       clockStates: arrayOrEmpty(data.clockStates),
       submissions: arrayOrEmpty(data.submissions),
       vacations: mergeCrewVacations(data.capabilities?.canUseOperations ? data.vacations : null, data.capabilities?.canUseOperations ? payroll.vacations : null),
+      openShiftReviews: data.capabilities?.canUseOperations ? data.openShiftReviews : null,
       myHours: payroll.myHours,
       myHoursSummary: payroll.myHoursSummary,
       myHoursMessage: payroll.myHoursMessage,
@@ -1024,7 +1026,7 @@ function hasAttendanceClockInToday(worker) {
   const status = clockStateFor(worker)?.status;
   return status === "Clocked In"
     || status === "Clocked Out"
-    || !!activeShiftFor(worker)
+    || !!(activeShiftFor(worker) && localDateKey(new Date(activeShiftFor(worker).start)) === todayKey())
     || payroll.submissions.some((row) => row.worker === worker && row.date === todayKey())
     || state.shifts.some((shift) => shift.worker === worker && localDateKey(new Date(shift.start)) === todayKey());
 }
@@ -2135,7 +2137,7 @@ function renderOperations() {
   const operationsView = renderOperationsFreshnessV30();
   if (!operationsView.hasComplete) {
     els.clockedInCount.textContent = "—";els.clockedOutCount.textContent = "—";els.teamHours.textContent = "—";
-    els.teamList.innerHTML = '<p class="empty-state">Complete team data is unavailable. Your saved and pending clock records remain in Clock.</p>';
+    els.teamList.innerHTML = '<p class="empty-state">Attendance alerts temporarily paused. Complete team data is unavailable; no verified count is available. Previous-day shift review is unavailable. Your saved and pending clock records remain in Clock.</p>';
     return;
   }
   const activeEntries = Object.values(state.activeShifts).filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
@@ -2210,6 +2212,54 @@ function operationsHourSegments() {
   return dedupeSegments(segments);
 }
 
+// Manager display projection only. No storage writes, attendance capture or reminder decisions.
+function attendanceVisibilityScopeV30() {
+  const scope = JSON.stringify([currentWorker(), state.auth?.token || "", todayKey()]);
+  if (attendanceVisibilityV30.scope !== scope) attendanceVisibilityV30 = {scope, snapshot: null, reviews: null};
+  return attendanceVisibilityV30;
+}
+function attendanceVisibilityViewV30() {
+  const cache = attendanceVisibilityScopeV30();
+  const freshness = operationsFreshnessV30();
+  const verified = !authExpiredV30() && crewVacationAlertsAvailable();
+  const absent = new Set(payroll.absences.filter(e => e.date === todayKey() && e.status === "Absent").map(e => e.worker));
+  payroll.clockStates.filter(e => e.date === todayKey() && e.status === "Absent").forEach(e => absent.add(e.worker));
+  if (isAbsentToday()) absent.add(currentWorker());
+  if (verified) {
+    cache.snapshot = {at: operationsReadV30.loadedAt,
+      missing: activeAttendanceEmployees()
+        .filter(e => !crewVacationFor(e.worker) && !hasAttendanceClockInToday(e.worker) && !absent.has(e.worker))
+        .map(e => ({worker:e.worker, status:"Not Clocked In", statusClass:"pending"})).sort(compareAlertPeople),
+      clockedIn: payroll.clockStates.filter(e => e.date === todayKey() && e.status === "Clocked In")
+        .map(e => ({worker:e.worker, status:"Still Clocked In", statusClass:"",jobsite:e.jobsite,clockIn:e.clockInAt})).sort(compareAlertPeople)};
+  }
+  // Positive evidence may remove an obsolete cached alert, never create a new missing-attendance decision.
+  const missing = (cache.snapshot?.missing || []).filter(e =>
+    activeAttendanceEmployees().some(a => a.worker === e.worker) && !hasAttendanceClockInToday(e.worker)
+      && !absent.has(e.worker) && !crewVacationFor(e.worker));
+  const cachedAt = cache.snapshot ? " Last verified: " + cache.snapshot.at + "." : "";
+  const notice = verified ? "Verified current attendance." : freshness.status === "loading" && cache.snapshot
+    ? "Refreshing… Showing cached attendance counts." + cachedAt
+    : "Attendance alerts temporarily paused. " + (cache.snapshot ? "Showing cached attendance counts." : "No verified count available.") + cachedAt;
+  const clockedIn = (cache.snapshot?.clockedIn || []).filter(e => !absent.has(e.worker)
+    && !payroll.clockStates.some(r => r.worker === e.worker && r.date === todayKey() && r.status === "Clocked Out")
+    && !state.shifts.some(r => r.worker === e.worker && localDateKey(new Date(r.start)) === todayKey() && r.end));
+  return {verified, missing, clockedIn, countKnown:!!cache.snapshot,
+    countLabel:verified ? "current" : cache.snapshot ? "cached" : "", notice};
+}
+function previousShiftReviewSectionV30() {
+  const cache = attendanceVisibilityScopeV30(), view = payroll.openShiftReviews;
+  const valid = view?.status === "available" && view.date === todayKey() && Array.isArray(view.items)
+    && view.items.every(e => typeof e.worker === "string" && e.worker && typeof e.jobsite === "string"
+      && /^\d{4}-\d{2}-\d{2}$/.test(e.date) && e.date < todayKey() && typeof e.clockInAt === "string" && Number.isFinite(Date.parse(e.clockInAt)));
+  const fresh = !authExpiredV30() && operationsFreshnessV30().status === "current" && valid;
+  if (fresh) cache.reviews = {at:operationsReadV30.loadedAt,items:view.items.map(e => ({worker:e.worker,
+    jobsite:e.jobsite,status:"Office review",statusClass:"pending",detail:e.date + " — unresolved previous-day shift",clockIn:e.clockInAt}))};
+  return {key:"previousOpenShifts",title:"Previous-day shifts — office review",actionable:fresh && !!cache.reviews?.items.length,
+    people:cache.reviews?.items || [],countKnown:!!cache.reviews,countLabel:fresh ? "current" : cache.reviews ? "cached" : "",
+    notice:fresh ? "" : cache.reviews ? "Previous-day shift review uses cached data." : "Previous-day shift review unavailable; no verified count available."};
+}
+
 function buildOperationsGroups(absentWorkers) {
   const groups = new Map();
   const vacationGroup = {jobsite: "Vacation", colour: "#7353a6", people: [], isVacation: true};
@@ -2222,7 +2272,8 @@ function buildOperationsGroups(absentWorkers) {
 
   payroll.employees.forEach((employee) => {
     const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
-    const active = state.activeShifts[employee.worker] || (stateRow?.status === "Clocked In" ? {
+    const localActive = state.activeShifts[employee.worker];
+    const active = (localActive && localDateKey(new Date(localActive.start)) === todayKey() ? localActive : null) || (stateRow?.status === "Clocked In" ? {
       worker: employee.worker,
       jobsite: stateRow.jobsite,
       start: stateRow.clockInAt,
@@ -2282,6 +2333,12 @@ function buildOperationsGroups(absentWorkers) {
 
   if (vacationGroup.people.length || crewVacationIndicatorV30()) jobsiteGroups.push(vacationGroup);
   if (absentGroup.people.length) jobsiteGroups.push(absentGroup);
+  const visibility = attendanceVisibilityViewV30();
+  jobsiteGroups.push({jobsite: "Not Clocked In", colour: "#a46b16", people: visibility.missing,
+    notice: visibility.notice, countKnown: visibility.countKnown, countLabel: visibility.countLabel});
+  const review = previousShiftReviewSectionV30();
+  if (review.people.length || review.notice) jobsiteGroups.push({jobsite: review.title, colour: "#a46b16",
+    people: review.people, notice: review.notice, countKnown: review.countKnown, countLabel: review.countLabel});
   return jobsiteGroups;
 }
 
@@ -2292,9 +2349,10 @@ function renderOperationsGroup(group) {
       <header class="jobsite-group-header">
         <span class="jobsite-colour" aria-hidden="true"></span>
         <strong>${escapeHtml(group.jobsite)}${group.isVacation && crewVacationIndicatorV30() ? `<small class="vacation-data-indicator" role="status">${escapeHtml(crewVacationIndicatorV30())}</small>` : ""}</strong>
-        <span>${group.people.length}</span>
+        <span>${group.countKnown === false ? "—" : group.people.length}${group.countLabel ? ` · ${escapeHtml(group.countLabel)}` : ""}</span>
       </header>
       <div class="jobsite-crew">
+        ${group.notice ? `<p role="status">${escapeHtml(group.notice)}</p>` : ""}
         ${group.people.map(renderOperationsPerson).join("")}
       </div>
     </section>
@@ -2308,6 +2366,7 @@ function renderOperationsPerson(person) {
       <div>
         <span class="person-name">${escapeHtml(person.worker)}</span>
         ${person.clockIn ? `<span class="person-sub">Clock-in ${timeLabel(person.clockIn)}</span>` : ""}
+          ${person.detail ? `<span class="person-sub">${escapeHtml(person.detail)}</span>` : ""}
       </div>
       <span class="person-status-stack">
         ${person.vacation && person.canRemoveAbsence ? `<span class="mini-pill vacation">Vacation</span>` : ""}
@@ -2526,9 +2585,9 @@ function renderAlerts() {
     return;
   }
   const groups = buildAlertGroups();
-  const signature = alertGroupsSignature(groups) + crewVacationNotice();
+  const signature = alertGroupsSignature(groups);
   if (els.alertsList.dataset.alertSignature === signature) return;
-  els.alertsList.innerHTML = crewVacationNotice() + groups.map(renderAlertGroup).join("");
+  els.alertsList.innerHTML = groups.map(renderAlertGroup).join("");
   els.alertsList.dataset.alertSignature = signature;
   bindAlertSectionState();
 }
@@ -2540,7 +2599,7 @@ function alertGroupsSignature(groups) {
       key: section.key,
       title: section.title,
       actionable: !!section.actionable,
-      people: section.people,
+      people: section.people, notice: section.notice || "", countKnown: section.countKnown, countLabel: section.countLabel || "",
     })),
   })));
 }
@@ -2554,41 +2613,28 @@ function buildAlertSections() {
     .map((entry) => entry.worker));
   if (isAbsentToday()) absentWorkers.add(currentWorker());
 
-  const activeMap = new Map();
-  payroll.clockStates
-    .filter((entry) => entry.date === todayKey() && entry.status === "Clocked In")
-    .forEach((entry) => {
-      activeMap.set(entry.worker, {
-        worker: entry.worker,
-        status: "Still Clocked In",
-        statusClass: "",
-        jobsite: entry.jobsite,
-        clockIn: entry.clockInAt,
-      });
-    });
-
   const switchedPeople = switchedJobsitePeople();
 
   return [
     {
       key: "notClockedIn",
       title: "Not Clocked In",
-      actionable: true,
-      people: activeAttendanceEmployees()
-        .filter((employee) => (crewVacationHasWork(employee.worker) || (crewVacationAlertsAvailable() && !crewVacationFor(employee.worker))) && !hasAttendanceClockInToday(employee.worker) && !absentWorkers.has(employee.worker))
-        .map((employee) => ({
-          worker: employee.worker,
-          status: "Not Clocked In",
-          statusClass: "pending",
-        }))
-        .sort(compareAlertPeople),
+      people: attendanceVisibilityViewV30().missing,
+      actionable: attendanceVisibilityViewV30().verified,
+      notice: attendanceVisibilityViewV30().notice,
+      countKnown: attendanceVisibilityViewV30().countKnown,
+      countLabel: attendanceVisibilityViewV30().countLabel,
     },
     {
       key: "stillClockedIn",
       title: "Still Clocked In",
-      actionable: true,
-      people: isAfterStillClockedInAlertTime() ? [...activeMap.values()].sort(compareAlertPeople) : [],
+      people: isAfterStillClockedInAlertTime() ? attendanceVisibilityViewV30().clockedIn : [],
+      actionable: attendanceVisibilityViewV30().verified,
+      notice: attendanceVisibilityViewV30().notice,
+      countKnown: attendanceVisibilityViewV30().countKnown,
+      countLabel: attendanceVisibilityViewV30().countLabel,
     },
+    previousShiftReviewSectionV30(),
     {
       key: "saveProblems",
       title: "Save Problems",
@@ -2635,7 +2681,7 @@ function buildAlertGroups() {
   return [
     {
       title: "Needs Attention",
-      sections: ["notClockedIn", "stillClockedIn", "saveProblems"].map((key) => byKey.get(key)),
+      sections: ["notClockedIn", "stillClockedIn", "previousOpenShifts", "saveProblems"].map((key) => byKey.get(key)),
     },
     {
       title: "Today's Activity",
@@ -2700,10 +2746,11 @@ function renderAlertSection(section) {
       <summary class="alert-section-header">
         <span class="alert-chevron" aria-hidden="true"></span>
         <strong>${escapeHtml(section.title)}</strong>
-        <span class="alert-count">${section.people.length}</span>
+        <span class="alert-count">${section.countKnown === false ? "—" : section.people.length}${section.countLabel ? ` · ${escapeHtml(section.countLabel)}` : ""}</span>
       </summary>
       <div class="alert-people">
-        ${section.people.length ? section.people.map(renderAlertPerson).join("") : `<p class="empty-state">No items right now.</p>`}
+        ${section.notice ? `<p role="status">${escapeHtml(section.notice)}</p>` : ""}
+        ${section.people.length ? section.people.map(renderAlertPerson).join("") : `<p class="empty-state">${section.countKnown === false ? "No verified count available." : section.countLabel === "cached" ? "No items in the cached list." : "No items right now."}</p>`}
       </div>
     </details>
   `;
