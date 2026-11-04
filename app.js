@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-notification-reregister-20261030";
+const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -198,6 +198,14 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-notification-reregister-20261030";
         throw error;
       }
     }
+    static recoveryMessage(error, stage, receipt) {
+      const detail = error.message || String(error);
+      if (stage === "schedule" && receipt) return `Attendance confirmed; crew schedule ${error.needsAttention || error.isBackendError && !error.retryable ? "needs review" : "acknowledgment pending"}. ${detail}`;
+      if (stage === "cleanup" && receipt) return `Attendance confirmed; session cleanup pending. ${detail}`;
+      if (error.needsAttention) return `Acknowledgment needs review; original record retained. ${detail}`;
+      if (error.isBackendError && !error.retryable) return `Needs review; original record retained. ${detail}`;
+      return `Connection or response delayed; original record retained for retry. ${detail}`;
+    }
     async drain(worker, send, options = {}) {
       if (this.running) {
         const running = this.running;
@@ -220,6 +228,7 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-notification-reregister-20261030";
         visited.add(entry.key);
         attempted++;
         let receipt = entry.receipt;
+        let stage = this.store === "starts" ? "clockIn" : "attendance";
         try {
           if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
           if (this.store === "starts") {
@@ -236,15 +245,17 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-notification-reregister-20261030";
             // A late response must not initiate another request after conflict, lease takeover or logout.
             if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
             const report = { ...clone(entry.immutable.schedule), sourceSubmissionId: data.submissionId };
-            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly });
+            stage = "schedule";
+            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly || data.reconciliation?.scheduleVerifyOnly === true });
             Outbox.verifySchedule(scheduleData, report);
           }
+          stage = "cleanup";
           if (data.openShiftCleanup?.ok === false) throw new Error("Hours received; open-shift cleanup pending. Retrying safely.");
           await this.finish(entry, { status: "saved", receipt, savedAt: this.now(), error: "" });
         } catch (error) {
           const attention = !!(error.needsAttention || error.isBackendError && !error.retryable);
           const delay = Math.min(300000, 2000 * 2 ** Math.min(entry.attempts, 7)) + Math.floor(Math.random() * 1000);
-          await this.finish(entry, { status: attention ? "attention" : "queued", receipt, error: error.message || String(error), nextAttempt: this.now() + delay });
+          await this.finish(entry, { status: attention ? "attention" : "queued", receipt, error: Outbox.recoveryMessage(error,stage,receipt), nextAttempt: this.now() + delay });
           if (options.onError) options.onError(error, entry);
         }
         if (options.onChange) await options.onChange();
