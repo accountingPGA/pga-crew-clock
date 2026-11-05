@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
+const APP_REVISION_V30 = "pga-crew-clock-v30-sync-reliability-20261105";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -126,14 +126,15 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
       if (result.blocked) throw new Error(result.error);
       return result;
     }
-    async claim(worker, manual = false, excluded = new Set()) {
+    async claim(worker, manual = false, excluded = new Set(), reconcileAttention = false) {
       return this.transaction([this.store], "readwrite", (tx, done) => {
         const entries = tx.objectStore(this.store);
         entries.getAll().onsuccess = e => {
           const now = this.now();
-          const row = e.target.result.filter(r => !excluded.has(r.key) && r.immutable.payload.worker === worker && r.status !== "saved" && !r.blocked && (r.leaseUntil || 0) <= now && (manual || r.status !== "attention") && (manual || r.nextAttempt <= now))
+          const row = e.target.result.filter(r => !excluded.has(r.key) && r.immutable.payload.worker === worker && r.status !== "saved" && !r.blocked && (r.leaseUntil || 0) <= now && (manual || r.status !== "attention" || reconcileAttention) && (manual || r.nextAttempt <= now))
             .sort((a, b) => a.capturedAt - b.capturedAt)[0];
           if (!row) return done(null);
+          row.probeOnly = !manual && row.status === "attention";
           row.lease = `${this.owner}:${now}:${Math.random()}`;
           row.leaseUntil = now + 60000;
           row.status = "sending";
@@ -188,6 +189,13 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
       }
       return receipt;
     }
+    static attendanceConfirmed(entry) {
+      if (entry?.blocked || !entry?.receipt || !entry.immutable?.payload) return false;
+      try {
+        Outbox.verifyShift({ok:true,submissionId:entry.receipt.submissionId,receipt:entry.receipt},entry.immutable.payload);
+        return true;
+      } catch { return false; }
+    }
     static scheduleProof(report) {
       return Object.fromEntries(["scheduleId", "date", "jobsite", "scheduledStart", "scheduledEnd", "reportedBy", "sourceSubmissionId"].map(k => [k, report[k] || ""]));
     }
@@ -223,7 +231,7 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
       for (;;) {
         if (options.maxEntries && attempted >= options.maxEntries) break;
         if (options.canSend && !options.canSend(worker)) break;
-        const entry = await this.claim(worker, !!options.manual, visited);
+        const entry = await this.claim(worker, !!options.manual, visited, !!options.reconcileAttention);
         if (!entry) break;
         visited.add(entry.key);
         attempted++;
@@ -232,21 +240,28 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-reliability-20261104";
         try {
           if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
           if (this.store === "starts") {
-            const data = await send("saveClockIn", { clockIn: clone(entry.immutable.payload), clientProtocol: 30 });
+            const data = await send(entry.probeOnly ? "reconcileClockIn" : "saveClockIn", { clockIn: clone(entry.immutable.payload), clientProtocol: 30, verifyOnly: !!entry.probeOnly, reconcileOnly: !!entry.probeOnly });
             receipt = Outbox.verifyStart(data, entry.immutable.payload);
             await this.finish(entry, { status: "saved", receipt, savedAt: this.now(), error: "" });
             if (options.onChange) await options.onChange();
             continue;
           }
           // Re-send the same immutable shift to reconcile a lost acknowledgement or cleanup failure.
-          const data = await send("saveShift", { shift: clone(entry.immutable.payload), clientProtocol: 30, verifyOnly: entry.verifyOnly });
+          const data = await send(entry.probeOnly ? "reconcileShift" : "saveShift", { shift: clone(entry.immutable.payload), clientProtocol: 30, verifyOnly: entry.verifyOnly || !!entry.probeOnly, reconcileOnly: !!entry.probeOnly });
           receipt = Outbox.verifyShift(data, entry.immutable.payload);
+          if (entry.immutable.payload.crewScheduleConfirmation && !entry.immutable.schedule) {
+            stage = "schedule";
+            throw Object.assign(new Error("Original schedule details are retained, but a complete local acknowledgment request is unavailable. Office review required."),{needsAttention:true});
+          }
           if (entry.immutable.schedule) {
             // A late response must not initiate another request after conflict, lease takeover or logout.
             if (!(await this.owns(entry)) || options.canSend && !options.canSend(worker)) continue;
             const report = { ...clone(entry.immutable.schedule), sourceSubmissionId: data.submissionId };
             stage = "schedule";
-            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly || data.reconciliation?.scheduleVerifyOnly === true });
+            const original = entry.immutable.payload.crewScheduleConfirmation;
+            if (original && [["id","scheduleId"],["date","date"],["jobsite","jobsite"],["scheduledStart","scheduledStart"],["scheduledEnd","scheduledEnd"],["worker","reportedBy"],["role","reportedRole"],["reportedAt","reportedAt"]]
+              .some(([captured,key]) => original[captured] !== report[key])) throw Object.assign(new Error("Schedule acknowledgment differs from the original captured confirmation. Original details retained for office review."),{needsAttention:true});
+            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly || !!entry.probeOnly || data.reconciliation?.scheduleVerifyOnly === true });
             Outbox.verifySchedule(scheduleData, report);
           }
           stage = "cleanup";
@@ -2152,10 +2167,10 @@ function renderOperations() {
     els.teamList.innerHTML = '<p class="empty-state">Attendance alerts temporarily paused. Complete team data is unavailable; no verified count is available. Previous-day shift review is unavailable. Your saved and pending clock records remain in Clock.</p>';
     return;
   }
-  const activeEntries = Object.values(state.activeShifts).filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
-  const completed = state.shifts.filter((shift) => localDateKey(new Date(shift.start)) === todayKey());
-  const todayStates = payroll.clockStates.filter((entry) => entry.date === todayKey());
-  const clockedInWorkers = new Set(activeEntries.map((shift) => shift.worker));
+  const server = managerServerAttendanceV34();
+  const completed = server.submissions;
+  const todayStates = server.clockStates;
+  const clockedInWorkers = new Set();
   todayStates.filter((entry) => entry.status === "Clocked In").forEach((entry) => clockedInWorkers.add(entry.worker));
   const absentWorkers = new Set(payroll.absences.filter((entry) => entry.date === todayKey() && entry.status === "Absent").map((entry) => entry.worker));
   todayStates.filter((entry) => entry.status === "Absent").forEach((entry) => absentWorkers.add(entry.worker));
@@ -2175,52 +2190,23 @@ function renderOperations() {
   bindTransferExpansionState();
 }
 
+function managerServerAttendanceV34() {
+  const read = operationsReadV30;
+  if (!canUseOperations() || read.worker !== currentWorker() || read.token !== state.auth?.token || read.day !== todayKey()) return {clockStates:[],submissions:[]};
+  return {clockStates:(read.serverClockStates || []).filter(e=>e.date===todayKey()),
+    submissions:(read.serverSubmissions || []).filter(e=>e.date===todayKey())};
+}
+function managerServerSegmentsV34(worker) {
+  return managerServerAttendanceV34().submissions.filter(r=>!worker || r.worker===worker)
+    .map(r=>({sourceId:r.submissionId || "",worker:r.worker,jobsite:r.jobsite,start:r.clockInAt,end:r.clockOutAt})).sort(compareSegments);
+}
+function hasServerAttendanceV34(worker) {
+  const server = managerServerAttendanceV34();
+  return server.submissions.some(e=>e.worker===worker) || server.clockStates.some(e=>e.worker===worker && ["Clocked In","Clocked Out"].includes(e.status));
+}
 function operationsHourSegments() {
-  const segments = [];
-  payroll.submissions
-    .filter((row) => row.date === todayKey())
-    .forEach((row) => {
-      segments.push({
-        sourceId: row.submissionId || "",
-        worker: row.worker,
-        jobsite: row.jobsite,
-        start: row.clockInAt,
-        end: row.clockOutAt,
-      });
-    });
-  state.shifts
-    .filter((shift) => localDateKey(new Date(shift.start)) === todayKey())
-    .forEach((shift) => {
-      segments.push({
-        sourceId: shift.id,
-        worker: shift.worker,
-        jobsite: shift.jobsite,
-        start: shift.start,
-        end: shift.end,
-      });
-    });
-  payroll.clockStates
-    .filter((entry) => entry.date === todayKey() && entry.status === "Clocked In")
-    .forEach((entry) => {
-      segments.push({
-        sourceId: entry.sessionId || "",
-        worker: entry.worker,
-        jobsite: entry.jobsite,
-        start: entry.clockInAt,
-        end: "",
-      });
-    });
-  Object.values(state.activeShifts)
-    .filter((shift) => localDateKey(new Date(shift.start)) === todayKey())
-    .forEach((shift) => {
-      segments.push({
-        sourceId: shift.id,
-        worker: shift.worker,
-        jobsite: shift.jobsite,
-        start: shift.start,
-        end: "",
-      });
-    });
+  const server = managerServerAttendanceV34(), segments = managerServerSegmentsV34();
+  server.clockStates.filter(e=>e.status==="Clocked In").forEach(e=>segments.push({sourceId:e.sessionId || "",worker:e.worker,jobsite:e.jobsite,start:e.clockInAt,end:""}));
   return dedupeSegments(segments);
 }
 
@@ -2235,26 +2221,26 @@ function attendanceVisibilityViewV30() {
   const freshness = operationsFreshnessV30();
   const verified = !authExpiredV30() && crewVacationAlertsAvailable();
   const absent = new Set(payroll.absences.filter(e => e.date === todayKey() && e.status === "Absent").map(e => e.worker));
-  payroll.clockStates.filter(e => e.date === todayKey() && e.status === "Absent").forEach(e => absent.add(e.worker));
+  managerServerAttendanceV34().clockStates.filter(e => e.date === todayKey() && e.status === "Absent").forEach(e => absent.add(e.worker));
   if (isAbsentToday()) absent.add(currentWorker());
   if (verified) {
     cache.snapshot = {at: operationsReadV30.loadedAt,
       missing: activeAttendanceEmployees()
-        .filter(e => !crewVacationFor(e.worker) && !hasAttendanceClockInToday(e.worker) && !absent.has(e.worker))
-        .map(e => ({worker:e.worker, status:"Not Clocked In", statusClass:"pending"})).sort(compareAlertPeople),
-      clockedIn: payroll.clockStates.filter(e => e.date === todayKey() && e.status === "Clocked In")
+        .filter(e => !crewVacationFor(e.worker) && !hasServerAttendanceV34(e.worker) && !absent.has(e.worker))
+        .map(e => ({worker:e.worker, status:"No verified clock-in", statusClass:"pending"})).sort(compareAlertPeople),
+      clockedIn: managerServerAttendanceV34().clockStates.filter(e => e.date === todayKey() && e.status === "Clocked In")
         .map(e => ({worker:e.worker, status:"Still Clocked In", statusClass:"",jobsite:e.jobsite,clockIn:e.clockInAt})).sort(compareAlertPeople)};
   }
   // Positive evidence may remove an obsolete cached alert, never create a new missing-attendance decision.
   const missing = (cache.snapshot?.missing || []).filter(e =>
-    activeAttendanceEmployees().some(a => a.worker === e.worker) && !hasAttendanceClockInToday(e.worker)
+    activeAttendanceEmployees().some(a => a.worker === e.worker) && !hasServerAttendanceV34(e.worker)
       && !absent.has(e.worker) && !crewVacationFor(e.worker));
   const notice = verified ? "Verified current attendance." : freshness.status === "loading" && cache.snapshot
     ? "Refreshing… Showing last verified attendance."
     : "Attendance alerts temporarily paused. " + (cache.snapshot ? "Showing cached attendance counts." : "No verified count available.");
   const clockedIn = (cache.snapshot?.clockedIn || []).filter(e => !absent.has(e.worker)
-    && !payroll.clockStates.some(r => r.worker === e.worker && r.date === todayKey() && r.status === "Clocked Out")
-    && !state.shifts.some(r => r.worker === e.worker && localDateKey(new Date(r.start)) === todayKey() && r.end));
+    && !managerServerAttendanceV34().clockStates.some(r => r.worker === e.worker && r.date === todayKey() && r.status === "Clocked Out")
+    && !managerServerAttendanceV34().submissions.some(r => r.worker === e.worker && r.clockOutAt));
   return {verified, missing, clockedIn, lastVerifiedAt:cache.snapshot?.at || null, countKnown:!!cache.snapshot,
     countLabel:verified ? "current" : cache.snapshot ? "cached" : "", notice};
 }
@@ -2282,18 +2268,13 @@ function buildOperationsGroups(absentWorkers) {
   };
 
   payroll.employees.forEach((employee) => {
-    const stateRow = payroll.clockStates.find((entry) => entry.worker === employee.worker && entry.date === todayKey());
-    const localActive = state.activeShifts[employee.worker];
-    const active = (localActive && localDateKey(new Date(localActive.start)) === todayKey() ? localActive : null) || (stateRow?.status === "Clocked In" ? {
-      worker: employee.worker,
-      jobsite: stateRow.jobsite,
-      start: stateRow.clockInAt,
-    } : null);
-    const activeForHistory = active || null;
-    const pendingSync = state.shifts.find(s => s.worker === employee.worker && localDateKey(new Date(s.start)) === todayKey() && s.syncStatus !== "saved");
-    const recent = latestCompletedSegmentFor(employee.worker);
-    const clockOutAt = latestCompletedClockOutFor(employee.worker) || stateRow?.clockOutAt || recent?.end || "";
-    const transferHistory = transferHistoryFor(employee.worker, activeForHistory);
+    const stateRow = managerServerAttendanceV34().clockStates.find(entry=>entry.worker===employee.worker);
+    const active = stateRow?.status === "Clocked In" ? {worker:employee.worker,jobsite:stateRow.jobsite,start:stateRow.clockInAt} : null;
+    const recentSegments = managerServerSegmentsV34(employee.worker);
+    const recent = recentSegments.length ? recentSegments[recentSegments.length-1] : null;
+    const clockOutAt = stateRow?.clockOutAt || recent?.end || "";
+    const transferHistory = transferHistoryFor(employee.worker,active,true);
+    const pendingSync = null; // Phone-only evidence is shown separately, never counted as server attendance.
     const absent = absentWorkers.has(employee.worker);
     const clockedOut = !!recent || stateRow?.status === "Clocked Out";
 
@@ -2345,8 +2326,12 @@ function buildOperationsGroups(absentWorkers) {
   if (vacationGroup.people.length || crewVacationIndicatorV30()) jobsiteGroups.push(vacationGroup);
   if (absentGroup.people.length) jobsiteGroups.push(absentGroup);
   const visibility = attendanceVisibilityViewV30();
-  jobsiteGroups.push({jobsite: "Not Clocked In", colour: "#a46b16", people: visibility.missing,
-    notice: visibility.notice, countKnown: visibility.countKnown, countLabel: visibility.countLabel});
+  jobsiteGroups.push({jobsite: "No verified clock-in", colour: "#a46b16", people: visibility.missing,
+    notice: visibility.notice + " Server records only; pending records on other phones are not visible.", countKnown: visibility.countKnown, countLabel: visibility.countLabel});
+  const phonePending = clockInSnapshot.filter(e=>e.shift.worker===currentWorker() && e.status!=="saved")
+    .map(e=>({worker:e.shift.worker,status:e.status==="attention"?"Phone only — Needs Attention":"Phone only — Pending Sync",statusClass:"pending",clockIn:e.shift.start,detail:e.shift.jobsite+" — "+(e.error || "not yet verified on server")}))
+    .concat(state.shifts.filter(e=>e.worker===currentWorker() && e.syncStatus!=="saved").map(e=>({worker:e.worker,status:e.attendanceConfirmed?"Attendance confirmed; review pending":"Phone save pending",statusClass:"pending",detail:e.error || e.jobsite})));
+  if(phonePending.length)jobsiteGroups.push({jobsite:"Pending on this device",colour:"#a46b16",people:phonePending,notice:"These records are retained locally and are separate from the server counts."});
   const review = previousShiftReviewSectionV30();
   if (review.people.length || review.notice) jobsiteGroups.push({jobsite: review.title, colour: "#a46b16",
     people: review.people, notice: review.notice, countKnown: review.countKnown, countLabel: review.countLabel});
@@ -2448,8 +2433,8 @@ function latestCompletedClockOutFor(worker) {
   return completedSegmentsFor(worker).reduce((latest, segment) => latestTime(latest, segment.end), "");
 }
 
-function transferHistoryFor(worker, active) {
-  const segments = completedSegmentsFor(worker);
+function transferHistoryFor(worker, active, verifiedOnly = false) {
+  const segments = verifiedOnly ? managerServerSegmentsV34(worker) : completedSegmentsFor(worker);
   if (active?.jobsite) {
     segments.push({
       worker,
@@ -3118,7 +3103,7 @@ async function hydrateOutboxV30() {
   const entries = (await outbox.list()).sort((a,b) => Date.parse(a.shift.end) - Date.parse(b.shift.end));
   for (const entry of entries) {
     const shift = { ...entry.shift, syncStatus: entry.status === "saved" ? "saved" : entry.status === "attention" ? "failed" : "pending",
-      error: entry.error || "", submissionId: entry.receipt?.submissionId || "" };
+      error: entry.error || "", submissionId: entry.receipt?.submissionId || "", attendanceConfirmed:CrewClockOutbox.attendanceConfirmed(entry) };
     state.shifts = state.shifts.filter(s => !(s.worker === shift.worker && s.id === shift.id));
     state.shifts.push(shift);
     if (shift.crewSchedule) {
@@ -3165,6 +3150,7 @@ async function syncCompletedOutboxV30(manual = false) {
       return sendOutboxV30(action,payload,worker,token);
     }, {
       manual,
+      reconcileAttention: true,
       canSend: w => !!state.auth && currentWorker() === w && state.auth.token === token && navigator.onLine !== false,
       onChange: async () => { await hydrateOutboxV30(); saveState(); render(); },
       onError: (error, entry) => {
@@ -3287,22 +3273,22 @@ async function syncOutbox(manual=false) {
         if(pending){
           const prior=(await clockIns.list()).filter(e=>e.shift.worker===worker&&e.shift.id!==pending.shift.id&&Date.parse(e.shift.start)<=Date.parse(pending.shift.start));
           const ends=await outbox.list();
-          const blocked=prior.some(e=>!ends.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&end.status==="saved"));
+          const blocked=prior.some(e=>!ends.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&CrewClockOutbox.attendanceConfirmed(end)));
           if(blocked){
             await syncCompletedOutboxV30(manual);
             const refreshed=await outbox.list();
-            if(prior.some(e=>!refreshed.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&end.status==="saved")))break;
+            if(prior.some(e=>!refreshed.some(end=>end.shift.worker===worker&&end.shift.id===e.shift.id&&CrewClockOutbox.attendanceConfirmed(end))))break;
           }
           // A different tab may hold the earliest start. Do not skip it and open a later one.
           const exclude=new Set((await clockIns.list()).filter(e=>e.key!==pending.key).map(e=>e.key));
-          await clockIns.drain(worker,(a,p)=>sendOutboxV30(a,p,worker,token),{manual,maxEntries:1,exclude,canSend:()=>state.auth?.token===token&&currentWorker()===worker&&navigator.onLine!==false});
+          await clockIns.drain(worker,(a,p)=>sendOutboxV30(a,p,worker,token),{manual,reconcileAttention:true,maxEntries:1,exclude,canSend:()=>state.auth?.token===token&&currentWorker()===worker&&navigator.onLine!==false});
         }
         await syncCompletedOutboxV30(manual);
         if(!pending)break;
         const after=(await clockIns.list()).find(e=>e.key===pending.key);
         if(after.status!=="saved")break;
         const completed=(await outbox.list()).find(e=>e.shift.worker===worker&&e.shift.id===pending.shift.id);
-        if(!completed||completed.status!=="saved")break;
+        if(!CrewClockOutbox.attendanceConfirmed(completed))break;
       }
       await hydrateOutboxV30();saveState();render();
     } catch(error){storageFailureV30(error);}
@@ -3344,6 +3330,8 @@ function markOperationsReadV30(phase, worker, token, data = null, error = "") {
       && ["employees", "clockStates", "submissions", "absences"].every(key => Array.isArray(data[key]));
     operationsReadV30 = { worker, token, loadedAt: complete ? new Date().toISOString() : null,
       day: complete ? data.today || todayKey() : "", loading: false,
+      serverClockStates:complete ? data.clockStates.map(e=>({...e})) : [],
+      serverSubmissions:complete ? data.submissions.map(e=>({...e})) : [],
       error: complete ? "" : "Complete team data was not returned. Refresh Operations to try again." };
   }
   if (phase === "error" && prior.loading) operationsReadV30 = { ...prior, loading: false, error: error || "Team data could not be refreshed." };
