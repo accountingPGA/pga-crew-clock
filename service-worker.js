@@ -1,5 +1,5 @@
 /* Production static shell only. No payroll data, authentication tokens or credentials. */
-const REVISION = "pga-crew-clock-v30-sync-components-20261107";
+const REVISION = "pga-crew-clock-v30-schedule-recovery-v35-20261110";
 const CACHE = REVISION;
 const PREFIX = 'pga-crew-clock-v30-';
 const BASE = new URL('./', self.registration.scope);
