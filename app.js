@@ -1,4 +1,4 @@
-const APP_REVISION_V30 = "pga-crew-clock-v30-sync-components-20261107";
+const APP_REVISION_V30 = "pga-crew-clock-v30-schedule-recovery-v35-20261110";
 /* Crew Clock V30: durable, immutable outbox. No authentication credentials stored here. */
 (function (root) {
   "use strict";
@@ -338,7 +338,7 @@ const APP_REVISION_V30 = "pga-crew-clock-v30-sync-components-20261107";
             const original = entry.immutable.payload.crewScheduleConfirmation;
             if (original && [["id","scheduleId"],["date","date"],["jobsite","jobsite"],["scheduledStart","scheduledStart"],["scheduledEnd","scheduledEnd"],["worker","reportedBy"],["role","reportedRole"],["reportedAt","reportedAt"]]
               .some(([captured,key]) => original[captured] !== report[key])) throw Object.assign(new Error("Schedule acknowledgment differs from the original captured confirmation. Original details retained for office review."),{needsAttention:true});
-            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, verifyOnly: entry.verifyOnly || !!entry.probeOnly || entry.scheduleVerifyOnly === true || components.schedule.status === "attention" && !options.manual });
+            const scheduleData = await send("saveCrewScheduleReport", { report, clientProtocol: 30, recoverOriginalMissingSchedule: true, verifyOnly: entry.verifyOnly || !!entry.probeOnly || entry.scheduleVerifyOnly === true || components.schedule.status === "attention" && !options.manual });
             Outbox.verifySchedule(scheduleData, report);
             components.schedule = {...components.schedule,status:"saved",error:"",nextAttempt:0,verifiedAt:this.now()};
             if (!(await this.checkpoint(entry,{scheduleReceipt:clone(scheduleData.receipt),syncComponents:components}))) continue;
