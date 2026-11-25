@@ -1,5 +1,5 @@
 /* Production static shell only. No payroll data, authentication tokens or credentials. */
-const REVISION = "pga-crew-clock-v30-schedule-recovery-v35-20261110";
+const REVISION = "pga-crew-clock-v30-sync-reliability-candidate-20261120-ui1";
 const CACHE = REVISION;
 const PREFIX = 'pga-crew-clock-v30-';
 const BASE = new URL('./', self.registration.scope);
@@ -12,10 +12,13 @@ const SHELL = ['./','index.html','app.js?v='+REVISION,'offline-outbox.js',
 const PATHS = new Set(SHELL.map(value => new URL(value).pathname));
 self.addEventListener('install', event => {
   event.waitUntil((async () => {
-    const replies = await Promise.all(SHELL.map(value => fetch(new Request(value, {cache:'reload'}))));
-    if (replies.some(reply => !reply.ok)) throw Error('Incomplete release shell; current version retained.');
     const cache = await caches.open(CACHE);
-    await Promise.all(replies.map((reply,i) => cache.put(SHELL[i],reply)));
+    // Consume each body promptly so retained responses cannot block queued fetches.
+    await Promise.all(SHELL.map(async value => {
+      const reply = await fetch(new Request(value, {cache:'reload'}));
+      if (!reply.ok) throw Error('Incomplete release shell; current version retained.');
+      await cache.put(value,reply);
+    }));
     await cache.put(url('.shell-complete'),new Response(REVISION));
     // No skipWaiting here: existing pages/active shifts are not forced to update.
   })());
